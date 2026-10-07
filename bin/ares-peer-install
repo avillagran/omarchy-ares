@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Install an isolated, per-user Ares Peer service without SSH provisioning."""
+
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+DEPENDENCIES = ('zeroconf==0.151.3', 'websockets==17.1')
+UNIT_NAME = 'ares-peer.service'
+
+
+def render_unit(port: int) -> str:
+    if not 1024 <= port <= 65535:
+        raise ValueError('peer port must be between 1024 and 65535')
+    return f'''[Unit]
+Description=Ares Peer: authenticated local Hermes/Herdr observation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/ares-peer/app
+ExecStart=%h/.local/share/ares-peer/venv/bin/python -m peer serve --bind 0.0.0.0 --port {port}
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+# No mount/userns sandboxing (PrivateTmp/PrivateDevices): it would put this
+# --user service in a user namespace, and the identity proof must read
+# sibling processes' /proc/<pid>/environ from the host user namespace.
+
+[Install]
+WantedBy=default.target
+'''
+
+
+def stage_package(source: Path, target: Path) -> None:
+    """Replace only installed application code, never the adjacent trust state."""
+    source = Path(source)
+    if not source.is_dir() or source.is_symlink() or not (source / '__main__.py').is_file():
+        raise ValueError('peer package is missing or unsafe')
+    for root, dirs, files in os.walk(source, followlinks=False):
+        if any((Path(root) / name).is_symlink() for name in (*dirs, *files)):
+            raise ValueError('peer package cannot contain symlinks')
+    target = Path(target)
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix='.app-stage-', dir=target.parent))
+    try:
+        shutil.copytree(source, scratch / 'peer', ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.git'))
+        for path in scratch.rglob('*'):
+            path.chmod(0o700 if path.is_dir() else 0o600)
+        old = target.with_name('.app-previous')
+        if old.exists():
+            shutil.rmtree(old)
+        if target.exists():
+            target.replace(old)
+        scratch.replace(target)
+        if old.exists():
+            shutil.rmtree(old)
+    finally:
+        if scratch.exists():
+            shutil.rmtree(scratch)
+
+
+def _run(*args: str) -> None:
+    subprocess.run(args, check=True)
+
+
+def install(source: Path, home: Path, port: int = 9431, *, enable: bool = True, runner=None) -> Path:
+    """Install app, isolated dependencies and a user unit; preserve credentials."""
+    runner = runner or _run
+    unit_text = render_unit(port)
+    state = Path(home) / '.local/share/ares-peer'
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state.chmod(0o700)
+    stage_package(source, state / 'app')
+    venv = state / 'venv'
+    if not (venv / 'bin/python').exists():
+        try:
+            runner(sys.executable, '-m', 'venv', str(venv))
+        except subprocess.CalledProcessError:
+            if not shutil.which('uv'):
+                raise
+            runner('uv', 'venv', str(venv))
+    if (venv / 'bin/pip').exists() or runner is not _run:
+        runner(str(venv / 'bin/python'), '-m', 'pip', 'install', '--disable-pip-version-check', *DEPENDENCIES)
+    elif shutil.which('uv'):
+        runner('uv', 'pip', 'install', '--python', str(venv / 'bin/python'), *DEPENDENCIES)
+    else:
+        raise RuntimeError('Ares Peer needs pip in its virtual environment or uv')
+    unit = Path(home) / '.config/systemd/user' / UNIT_NAME
+    unit.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    unit.parent.chmod(0o700)
+    unit.write_text(unit_text, encoding='utf-8')
+    unit.chmod(0o600)
+    if enable:
+        runner('systemctl', '--user', 'daemon-reload')
+        runner('systemctl', '--user', 'enable', '--now', UNIT_NAME)
+        runner('systemctl', '--user', 'restart', UNIT_NAME)
+    return unit
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--port', type=int, default=9431)
+    parser.add_argument('--no-enable', action='store_true', help='install without starting the service')
+    args = parser.parse_args()
+    source = Path(__file__).resolve().parent.parent / 'peer'
+    unit = install(source, Path.home(), args.port, enable=not args.no_enable)
+    print(f'Installed {unit}; service {"not started" if args.no_enable else "enabled"}')
+
+
+if __name__ == '__main__':
+    main()

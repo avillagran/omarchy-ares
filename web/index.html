@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title>Ares</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main id="login" class="login-card">
+    <div class="face" aria-hidden="true"><i></i><i></i></div>
+    <h1>Ares</h1>
+    <p>Open the access link copied from the Omarchy desktop panel — it already carries the token — or paste the token below. The token is stored only in this tab and is removed from the address bar.</p>
+    <form id="login-form">
+      <label>Access token<input id="token" type="password" autocomplete="off" required></label>
+      <button type="submit">Connect</button>
+      <output id="login-error" role="alert"></output>
+    </form>
+  </main>
+
+  <div id="app" class="app" hidden>
+    <header>
+      <button id="nav-toggle" class="icon" aria-label="Toggle projects">☰</button>
+      <div><strong>Ares</strong><small id="connection">connecting</small></div>
+      <div class="header-actions"><button id="refresh">Refresh</button><button id="logout">Disconnect</button></div>
+    </header>
+    <aside id="rail">
+      <div class="section-title"><span>Projects</span><span><button id="new-group">Group</button><button id="new-project">＋</button></span></div>
+      <nav id="projects"></nav>
+      <div class="section-title"><span>Rooms</span><button id="new-room">＋</button></div>
+      <nav id="rooms"></nav>
+      <details class="management"><summary>Management</summary><div id="management-state"></div></details>
+    </aside>
+    <section id="room" class="room-view">
+      <div id="empty" class="empty"><div class="face large"><i></i><i></i></div><h2>Select a room</h2><p>Every conversation belongs to a code project.</p></div>
+      <div id="room-content" hidden>
+        <div class="room-head"><div><small id="project-name"></small><h2 id="room-name"></h2><div id="participants"></div></div><div class="room-actions"><button id="pause">Pause</button><button id="delete-room" class="danger">Delete</button></div></div>
+        <div id="timeline" class="timeline" aria-live="polite"></div>
+        <button id="new-activity" class="new-activity" hidden>New activity ↓</button>
+        <form id="composer" class="composer">
+          <div id="attachment-preview" class="attachment-preview"></div>
+          <textarea id="prompt" rows="2" placeholder="Message this room" required></textarea>
+          <div class="composer-actions"><label class="attach">Attach image/video<input id="attachment" type="file" accept="image/*,video/*"></label><button id="send" type="submit">Send</button></div>
+          <output id="composer-status" role="status"></output>
+        </form>
+      </div>
+    </section>
+  </div>
+
+  <dialog id="project-dialog"><form method="dialog" id="project-form"><h2>New project</h2><label>Name<input name="name" required></label><label>Code path on the Ares host<input name="path" required></label><label>Group<select name="groupId" id="project-group"><option value="">Ungrouped</option></select></label><menu><button value="cancel">Cancel</button><button value="default">Create</button></menu></form></dialog>
+  <dialog id="group-dialog"><form method="dialog" id="group-form"><h2>New project group</h2><label>Name<input name="name" required></label><label>Shared instructions<textarea name="instructions" rows="4"></textarea></label><menu><button value="cancel">Cancel</button><button value="default">Create</button></menu></form></dialog>
+  <dialog id="room-dialog"><form method="dialog" id="room-form"><h2>New room</h2><label>Name<input name="name" required></label><label>Bot profile<input name="bot" value="default" required></label><menu><button value="cancel">Cancel</button><button value="default">Create</button></menu></form></dialog>
+  <dialog id="media-dialog" class="media-dialog"><button id="media-close" aria-label="Close">×</button><div id="media-large"></div></dialog>
+  <script type="module" src="/app.mjs"></script>
+</body>
+</html>

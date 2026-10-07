@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Durable local state for the first Omarchy Ares vertical slice."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+STATE_PATH = Path.home() / ".local" / "state" / "omarchy" / "ares" / "state.json"
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def empty_state() -> dict[str, Any]:
+    return {"version": 2, "nextSequence": 1, "projects": [], "rooms": [], "executions": [], "events": []}
+
+
+def migrate_v1(data: dict[str, Any]) -> dict[str, Any]:
+    migrated = empty_state()
+    migrated["projects"] = data.get("projects", [])
+    migrated["rooms"] = data.get("rooms", [])
+    migrated["events"] = data.get("events", [])
+    for room in migrated["rooms"]:
+        room.setdefault("status", "active")
+        room.setdefault("memoryRelease", "not-requested")
+    for sequence, event in enumerate(migrated["events"], start=1):
+        event["sequence"] = sequence
+        event.setdefault("executionId", None)
+    migrated["nextSequence"] = len(migrated["events"]) + 1
+    return migrated
+
+
+def load_state(path: Path = STATE_PATH) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return empty_state()
+    if not isinstance(data, dict):
+        return empty_state()
+    if data.get("version") == 1:
+        return migrate_v1(data)
+    if data.get("version") != 2:
+        return empty_state()
+    for key in ("projects", "rooms", "executions", "events"):
+        if not isinstance(data.get(key), list):
+            return empty_state()
+    if not isinstance(data.get("nextSequence"), int) or data["nextSequence"] < 1:
+        return empty_state()
+    return data
+
+
+def save_state(data: dict[str, Any], path: Path = STATE_PATH) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="state.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def project_by_id(data: dict[str, Any], project_id: str) -> dict[str, Any] | None:
+    return next((project for project in data["projects"] if project["id"] == project_id), None)
+
+
+def room_by_id(data: dict[str, Any], room_id: str) -> dict[str, Any] | None:
+    return next((room for room in data["rooms"] if room["id"] == room_id), None)
+
+
+def require_text(value: str, label: str) -> str:
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{label} is required")
+    if len(text) > 160:
+        raise ValueError(f"{label} is too long")
+    return text
+
+
+def append_event(data: dict[str, Any], project_id: str, room_id: str, kind: str, author: str, text: str,
+                 execution_id: str | None = None) -> dict[str, Any]:
+    room = room_by_id(data, room_id)
+    if room is None or room["projectId"] != project_id:
+        raise ValueError("room does not belong to the project")
+    event = {"id": f"evt_{uuid.uuid4().hex[:12]}", "sequence": data["nextSequence"], "roomId": room_id,
+             "executionId": execution_id, "kind": kind, "author": author, "text": text, "at": now()}
+    data["nextSequence"] += 1
+    data["events"].append(event)
+    return event
+
+
+def pause_room(data: dict[str, Any], project_id: str, room_id: str) -> dict[str, Any]:
+    room = room_by_id(data, room_id)
+    if room is None or room["projectId"] != project_id:
+        raise ValueError("room does not belong to the project")
+    room["status"] = "paused"
+    room["memoryRelease"] = "unconfirmed"
+    return append_event(data, project_id, room_id, "room.pause.requested", "ares",
+                        "Pause requested; session memory release is not yet verified")
+
+
+def resume_room(data: dict[str, Any], project_id: str, room_id: str) -> dict[str, Any]:
+    room = room_by_id(data, room_id)
+    if room is None or room["projectId"] != project_id:
+        raise ValueError("room does not belong to the project")
+    room["status"] = "active"
+    room["memoryRelease"] = "not-requested"
+    return append_event(data, project_id, room_id, "room.resume.requested", "ares",
+                        "Resume requested; no Hermes session was started by this local slice")
+
+
+def emit(value: dict[str, Any]) -> int:
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def command_list(_: argparse.Namespace) -> int:
+    data = load_state()
+    rooms = []
+    for room in data["rooms"]:
+        project = project_by_id(data, room["projectId"])
+        if project is None:
+            continue
+        entries = [event for event in data["events"] if event["roomId"] == room["id"]]
+        rooms.append({**room, "projectName": project["name"], "eventCount": len(entries),
+                      "lastEventAt": entries[-1]["at"] if entries else room["createdAt"]})
+    rooms.sort(key=lambda room: room["lastEventAt"], reverse=True)
+    return emit({"ok": True, "version": data["version"], "projects": data["projects"], "rooms": rooms, "executions": data["executions"],
+                 "events": data["events"], "nextSequence": data["nextSequence"]})
+
+
+def command_create_project(args: argparse.Namespace) -> int:
+    name = require_text(args.name, "project name")
+    location = Path(args.path).expanduser().resolve()
+    if not location.is_dir():
+        raise ValueError("project path must be an existing directory")
+    data = load_state()
+    duplicate = next((project for project in data["projects"] if project["path"] == str(location) and project["node"] == args.node), None)
+    if duplicate is not None:
+        return emit({"ok": True, "project": duplicate, "created": False})
+    project = {"id": f"prj_{uuid.uuid4().hex[:12]}", "name": name, "path": str(location),
+               "node": args.node, "createdAt": now()}
+    data["projects"].append(project)
+    save_state(data)
+    return emit({"ok": True, "project": project, "created": True})
+
+
+def command_create_room(args: argparse.Namespace) -> int:
+    name = require_text(args.name, "room name")
+    bot = require_text(args.bot, "bot")
+    data = load_state()
+    if project_by_id(data, args.project_id) is None:
+        raise ValueError("project does not exist")
+    room = {"id": f"room_{uuid.uuid4().hex[:12]}", "projectId": args.project_id, "name": name,
+            "participants": [bot], "status": "active", "memoryRelease": "not-requested", "createdAt": now()}
+    data["rooms"].append(room)
+    append_event(data, args.project_id, room["id"], "room.created", "ares", "Room created")
+    save_state(data)
+    return emit({"ok": True, "room": room})
+
+
+def command_append_event(args: argparse.Namespace) -> int:
+    text = require_text(args.text, "event text")
+    data = load_state()
+    event = append_event(data, args.project_id, args.room_id, args.kind, args.author, text)
+    save_state(data)
+    return emit({"ok": True, "event": event, "execution": "not-started"})
+
+
+def command_pause_room(args: argparse.Namespace) -> int:
+    data = load_state()
+    event = pause_room(data, args.project_id, args.room_id)
+    save_state(data)
+    return emit({"ok": True, "event": event, "memoryRelease": "unconfirmed"})
+
+
+def command_resume_room(args: argparse.Namespace) -> int:
+    data = load_state()
+    event = resume_room(data, args.project_id, args.room_id)
+    save_state(data)
+    return emit({"ok": True, "event": event})
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    group = result.add_mutually_exclusive_group(required=True)
+    group.add_argument("--list", action="store_true")
+    group.add_argument("--create-project", action="store_true")
+    group.add_argument("--create-room", action="store_true")
+    group.add_argument("--append-event", action="store_true")
+    group.add_argument("--pause-room", action="store_true")
+    group.add_argument("--resume-room", action="store_true")
+    result.add_argument("--name", default="")
+    result.add_argument("--path", default="")
+    result.add_argument("--node", default="local")
+    result.add_argument("--project-id", default="")
+    result.add_argument("--room-id", default="")
+    result.add_argument("--bot", default="default")
+    result.add_argument("--kind", default="message.user")
+    result.add_argument("--author", default="user")
+    result.add_argument("--text", default="")
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.list:
+            return command_list(args)
+        if args.create_project:
+            return command_create_project(args)
+        if args.create_room:
+            return command_create_room(args)
+        if args.append_event:
+            return command_append_event(args)
+        if args.pause_room:
+            return command_pause_room(args)
+        return command_resume_room(args)
+    except ValueError as error:
+        return emit({"ok": False, "error": str(error)}) or 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

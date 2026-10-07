@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Inventory-based attachment is identical for every CLI and Herdr session.
+# No start, focus, or takeover operation is allowed on this path.
+if [[ "${1:-}" == terminal ]]; then
+  if [[ $# -ne 5 || ! "$2" =~ ^[[:alnum:]_-]{1,128}$ ||
+        ( -n "$3" && ! "$3" =~ ^[[:alnum:]_-]+@[[:alnum:].-]+$ ) ||
+        ! "$4" =~ ^/[[:alnum:]/._-]+$ || ! "$5" =~ ^/[[:alnum:]/._-]+$ ||
+        "$4" == *"/../"* || "$5" == *"/../"* ||
+        "$4" == *"/./"* || "$5" == *"/./"* || "$5" != */herdr.sock ]]; then
+    printf 'Invalid Herdr terminal identity\n' >&2
+    exit 2
+  fi
+  for key in ${!HERDR_@}; do unset "$key"; done
+  if [[ -z "$3" ]]; then
+    export HERDR_SOCKET_PATH="$5"
+    exec "$4" terminal attach "$2"
+  fi
+  # The peer may itself inherit nested pane variables from its SSH environment.
+  exec ssh -tt -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes \
+    -- "$3" "python3 -c 'import os,sys; e={k:v for k,v in os.environ.items() if not k.startswith(\"HERDR_\")}; e[\"HERDR_SOCKET_PATH\"]=sys.argv[2]; os.execve(sys.argv[1],[sys.argv[1],\"terminal\",\"attach\",sys.argv[3]],e)' $4 $5 $2"
+fi
+
+# Attach the selected agent directly: no workspace sidebar or second input bar.
+# QMLTermWidget passes a session selector and agent or pane identity.
+if [[ "${1:-}" == remote ]]; then
+  if [[ $# -ne 5 || ! "$2" =~ ^w[[:alnum:]]+:p[[:alnum:]]+$ ||
+        ! "$3" =~ ^[[:alnum:]_-]+@[[:alnum:].-]+$ ||
+        ! "$4" =~ ^/[[:alnum:]/._-]+$ || ! "$5" =~ ^/[[:alnum:]/._-]+$ ||
+        "$4" == *"/../"* || "$5" == *"/../"* || "$5" != */herdr.sock ]]; then
+    printf 'Invalid remote terminal identity\n' >&2
+    exit 2
+  fi
+  # SSH carries this PTY into the peer's existing agent, not a new session.
+  exec env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_TAB_ID \
+    -u HERDR_WORKSPACE_ID -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH \
+    -u HERDR_BIN_PATH -u HERDR_HOME -u HERDR_SESSION \
+    ssh -tt -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes \
+      -- "$3" "env HERDR_SOCKET_PATH=$5 $4 agent attach $2"
+fi
+if [[ $# -ne 2 ]] ||
+  { [[ "$1" == ares ]] && [[ ! "$2" =~ ^ares-[0-9a-f]{24}$ ]]; } ||
+  { [[ "$1" == default ]] && [[ ! "$2" =~ ^w[[:alnum:]]+:p[[:alnum:]]+$ ]]; } ||
+  { [[ "$1" != ares && "$1" != default ]]; }; then
+  printf 'Invalid Ares agent identity\n' >&2
+  exit 2
+fi
+
+# Never inherit nested herdr pane context from a parent terminal.
+if [[ "$1" == default ]]; then
+  config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+  [[ "$config_home" == /* ]] || config_home="$HOME/.config"
+  exec env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_TAB_ID \
+    -u HERDR_WORKSPACE_ID -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH \
+    -u HERDR_BIN_PATH -u HERDR_HOME -u HERDR_SESSION \
+    HERDR_SOCKET_PATH="$config_home/herdr/herdr.sock" herdr agent attach "$2"
+fi
+exec env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_TAB_ID \
+  -u HERDR_WORKSPACE_ID -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH \
+  -u HERDR_BIN_PATH -u HERDR_HOME -u HERDR_SESSION \
+  herdr --session ares agent attach "$2"

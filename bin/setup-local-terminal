@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Link a locally built Qt 6 QMLTermWidget into the Ares plugin. The binary is
+# host-specific and is intentionally not committed to the plugin repository.
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+module=${1:-"$HOME/Work/qmltermwidget/build/QMLTermWidget"}
+module=$(realpath -- "$module")
+if [[ ! -f $module/qmldir || ! -f $module/libqmltermwidget.so || ! -d $module/color-schemes ]]; then
+  printf 'Expected a built QMLTermWidget module at %s\n' "$module" >&2
+  exit 1
+fi
+if [[ -e $root/QMLTermWidget && ! -L $root/QMLTermWidget ]]; then
+  printf 'Refusing to replace existing directory %s/QMLTermWidget\n' "$root" >&2
+  exit 1
+fi
+ln -sfn -- "$module" "$root/QMLTermWidget"
+
+config_dir="$HOME/.config/hypr"
+config="$config_dir/hyprland.lua"
+env_file="$config_dir/ares-terminal.lua"
+if [[ ! -f $config ]]; then
+  printf 'Hyprland configuration not found: %s\n' "$config" >&2
+  exit 1
+fi
+if [[ ! -e $env_file ]]; then
+  printf '%s\n' \
+    '-- Add the installed Ares plugin directory to Qt QML imports.' \
+    'local plugin = (os.getenv("HOME") or "") .. "/.config/omarchy/plugins/io.github.avillagran.omarchy-ares"' \
+    'local current = os.getenv("QML_IMPORT_PATH") or ""' \
+    'if current == "" then' \
+    '  hl.env("QML_IMPORT_PATH", plugin)' \
+    'elseif not (":" .. current .. ":"):find(":" .. plugin .. ":", 1, true) then' \
+    '  hl.env("QML_IMPORT_PATH", current .. ":" .. plugin)' \
+    'end' > "$env_file"
+fi
+if ! grep -Fqx 'require("hypr.ares-terminal")' "$config"; then
+  printf '\nrequire("hypr.ares-terminal")\n' >> "$config"
+fi
+if command -v hyprctl >/dev/null && hyprctl monitors -j >/dev/null 2>&1; then
+  hyprctl reload
+fi
+printf 'QMLTermWidget linked at %s/QMLTermWidget; restart Omarchy shell to load the module.\n' "$root"

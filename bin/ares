@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Ares local API client. Author: Andrés Villagrán.
+
+This CLI never accepts credentials on the command line. It reads the private local
+Ares token and delegates all operations to the versioned HTTP API.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import ares_cli_peers
+import ares_cli_terminal
+
+MAX_RESPONSE = 2 * 1024 * 1024
+TIMEOUT = 8
+
+
+class CliError(Exception):
+    pass
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        argv = sys.argv[1:]
+        if "peers" in argv and "pair" in argv:
+            # argparse can otherwise echo an unrecognized positional secret.
+            message = "Invalid peer pairing arguments (code is accepted only via prompt or --code-stdin)"
+        if "--json" in argv[:argv.index("--") if "--" in argv else len(argv)]:
+            print(json.dumps({"ok": False, "error": message}, sort_keys=True,
+                             separators=(",", ":")))
+            raise SystemExit(2)
+        super().error(message)
+
+
+def parser():
+    p = ArgumentParser(description="Ares projects and rooms (local API client)")
+    p.add_argument("--json", action="store_true", help="stable machine-readable output")
+    subjects = p.add_subparsers(dest="subject", required=True)
+    projects = subjects.add_parser("projects", help="list, inspect, or color projects")
+    project_cmd = projects.add_subparsers(dest="action", required=True)
+    project_cmd.add_parser("list")
+    project_cmd.add_parser("show").add_argument("id")
+    color = project_cmd.add_parser("map-color", help="set or reset a project's map color")
+    color_cmd = color.add_subparsers(dest="color_action", required=True)
+    color_cmd.add_parser("set").add_argument("id")
+    color_cmd.choices["set"].add_argument("color", help="CSS hex color")
+    color_cmd.add_parser("reset").add_argument("id")
+    rooms = subjects.add_parser("rooms", help="list, inspect, or update rooms")
+    room_cmd = rooms.add_subparsers(dest="action", required=True)
+    listing = room_cmd.add_parser("list")
+    listing.add_argument("--project", help="project ID")
+    filter_group = listing.add_mutually_exclusive_group()
+    filter_group.add_argument("--active", action="store_true")
+    filter_group.add_argument("--archived", action="store_true")
+    room_cmd.add_parser("show").add_argument("id")
+    for action in ("archive", "pause", "resume", "restore"):
+        command = room_cmd.add_parser(action)
+        command.add_argument("id")
+        command.add_argument("--project", required=True, help="project ID")
+        command.add_argument("--idempotency-key", required=True,
+                             help="caller-assigned unique key for safe retries")
+    for action in ("alias", "rename"):
+        command = room_cmd.add_parser(action, help="set room display alias (not canonical name)")
+        command.add_argument("id")
+        command.add_argument("alias")
+    ares_cli_terminal.register(subjects)
+    ares_cli_peers.register(subjects)
+    return p
+
+
+def token():
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    path = state / "omarchy/ares/access.token"
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+            raise CliError("Ares token must be a private regular file (mode 0600)")
+        secret = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise CliError("Cannot read private Ares token") from None
+    if not secret or "\n" in secret or "\r" in secret:
+        raise CliError("Ares token is invalid")
+    return secret
+
+
+def api_url():
+    base = os.environ.get("ARES_API_URL", "http://127.0.0.1:9420")
+    parsed = urllib.parse.urlsplit(base)
+    if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+            or parsed.username or parsed.password or parsed.path not in ("", "/")
+            or parsed.query or parsed.fragment):
+        raise CliError("ARES_API_URL must be an HTTP loopback origin")
+    return base.rstrip("/")
+
+
+def api(method, path, payload=None):
+    data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
+    request = urllib.request.Request(api_url() + path, data=data, method=method,
+                                     headers={"Authorization": "Bearer " + token(),
+                                              "Accept": "application/json",
+                                              **({"Content-Type": "application/json"} if data else {})})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            content = response.read(MAX_RESPONSE + 1)
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        content = exc.read(MAX_RESPONSE + 1)
+        status = exc.code
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise CliError("Cannot reach local Ares API") from None
+    if len(content) > MAX_RESPONSE:
+        raise CliError("Ares API response exceeds size limit")
+    try:
+        result = json.loads(content)
+    except (UnicodeError, ValueError):
+        raise CliError("Ares API returned invalid JSON") from None
+    if not isinstance(result, dict):
+        raise CliError("Ares API returned an invalid response")
+    if status >= 400 or result.get("ok") is False:
+        # Server errors can contain untrusted input; redact the credential.
+        message = str(result.get("error") or f"HTTP {status}").replace(token(), "[redacted]")
+        raise CliError(message[:500])
+    return result
+
+
+def segment(value):
+    return urllib.parse.quote(value, safe="")
+
+
+def state():
+    return api("GET", "/v1/state?compact=1")
+
+
+def entries(data, kind):
+    value = data.get(kind, [])
+    if not isinstance(value, list):
+        raise CliError("Ares state has an invalid " + kind + " collection")
+    return value
+
+
+def by_id(data, kind, identifier):
+    match = next((v for v in entries(data, kind) if isinstance(v, dict) and v.get("id") == identifier), None)
+    if match is None:
+        raise CliError(f"{kind[:-1]} not found: {identifier}")
+    return match
+
+
+def execute(args):
+    if hasattr(args, "id") and (not args.id or len(args.id.encode("utf-8")) > 128):
+        raise CliError("ID must be 1–128 bytes")
+    if args.subject == "projects":
+        if args.action == "list":
+            return {"ok": True, "projects": entries(state(), "projects")}
+        if args.action == "show":
+            return {"ok": True, "project": by_id(state(), "projects", args.id)}
+        color = args.color if args.color_action == "set" else ""
+        if color and (len(color) != 7 or color[0] != "#" or
+                      any(c not in "0123456789abcdefABCDEF" for c in color[1:])):
+            raise CliError("color must be a six-digit CSS hex value (e.g. #336699)")
+        return api("POST", "/v1/projects/" + segment(args.id) + "/map-color", {"color": color})
+    if args.action == "list":
+        snapshot = state()
+        rooms = (entries(snapshot, "archivedRooms") if args.archived else
+                 entries(snapshot, "rooms") if args.active else
+                 entries(snapshot, "rooms") + entries(snapshot, "archivedRooms"))
+        if args.project:
+            rooms = [r for r in rooms if isinstance(r, dict) and r.get("projectId") == args.project]
+        if args.active:
+            rooms = [r for r in rooms if isinstance(r, dict) and r.get("status") == "active"]
+        return {"ok": True, "rooms": rooms}
+    if args.action == "show":
+        snapshot = state()
+        return {"ok": True, "room": by_id({"rooms": entries(snapshot, "rooms") +
+                                            entries(snapshot, "archivedRooms")}, "rooms", args.id)}
+    if args.action in ("alias", "rename"):
+        if not args.alias.strip() or len(args.alias.encode("utf-8")) > 120:
+            raise CliError("alias must be 1–120 bytes")
+        return api("POST", "/v1/rooms/" + segment(args.id) + "/alias",
+                   {"alias": args.alias})
+    if (not args.idempotency_key.strip() or not args.project.strip() or
+            len(args.idempotency_key.encode("utf-8")) > 256 or
+            len(args.project.encode("utf-8")) > 128):
+        raise CliError("project and idempotency key must be nonempty and bounded")
+    return api("POST", "/v1/rooms/" + segment(args.id) + "/" + args.action,
+               {"projectId": args.project, "idempotencyKey": args.idempotency_key})
+
+
+def human(result):
+    if "projects" in result:
+        return "\n".join(f"{p.get('id', '?')}  {p.get('name', '')}" for p in result["projects"])
+    if "rooms" in result:
+        return "\n".join(f"{r.get('id', '?')}  {r.get('name', r.get('alias', ''))}  "
+                         f"[{r.get('status', '?')}]" for r in result["rooms"])
+    if "project" in result or "room" in result:
+        return json.dumps(result.get("project", result.get("room")), indent=2, ensure_ascii=False)
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+def main():
+    argv = sys.argv[1:]
+    # argparse normally requires parent options before the subcommand. Accept
+    # --json at either position without rewriting values after a literal --.
+    option_end = argv.index("--") if "--" in argv else len(argv)
+    if "--json" in argv[:option_end]:
+        argv = ["--json"] + [part for i, part in enumerate(argv)
+                             if part != "--json" or i >= option_end]
+    args = parser().parse_args(argv)
+    try:
+        if args.subject == "peers":
+            try:
+                result = ares_cli_peers.execute(args, api)
+            except ValueError as exc:
+                raise CliError(str(exc)) from None
+            output = (json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                      if args.json else ares_cli_peers.human(result))
+            print(output.replace(token(), "[redacted]"))
+            return 0
+        if args.subject == "terminals":
+            class LocalClient:
+                @staticmethod
+                def request(method, path, body=None):
+                    result = api(method, path, body)
+                    return json.loads(json.dumps(result).replace(token(), "[redacted]"))
+            return ares_cli_terminal.dispatch(args, LocalClient())
+        result = execute(args)
+        if args.json:
+            output = json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        else:
+            output = human(result)
+        print(output.replace(token(), "[redacted]"))
+        return 0
+    except CliError as exc:
+        failure = {"ok": False, "error": str(exc)}
+        if args.json:
+            print(json.dumps(failure, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        else:
+            print("ares: " + str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

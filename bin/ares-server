@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE="$ROOT/server/target/release/ares-server"
+
+if [[ ! -x "$ENGINE" ]]; then
+  printf 'Ares server is not built: run cargo build --release --manifest-path "%s/server/Cargo.toml"\n' "$ROOT" >&2
+  exit 127
+fi
+
+exec "$ENGINE" "$@"

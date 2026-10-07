@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.avillagran.omarchy-ares",
+  "name": "Omarchy Ares",
+  "version": "0.1.0",
+  "author": "Andrés Villagrán <andres@villagranquiroz.cl>",
+  "license": "MIT",
+  "description": "Project-owned rooms for Hermes work.",
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Omarchy Ares",
+    "description": "Browse code projects and their rooms.",
+    "category": "System",
+    "defaultSection": "right"
+  }
+}

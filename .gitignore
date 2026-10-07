@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.local/
+QMLTermWidget
+/app/target/
+/term/target/
+/server/target/
+.venv-laya/
+offline-only/

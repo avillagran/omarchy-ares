@@ -1,0 +1,28 @@
+[package]
+name = "ares-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["json", "query"] }
+bytes = "1"
+hex = "0.4"
+libc = "0.2"
+mime_guess = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "sync", "time", "net", "fs"] }
+tower-http = { version = "0.6", features = ["fs"] }
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+regex = "1"
+base64 = "0.22"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

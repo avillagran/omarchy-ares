@@ -1,0 +1,2966 @@
+#!/usr/bin/env python3
+"""hermes-bots — list active Hermes agent sessions or bot chat messages.
+
+Modes:
+  hermes-bots           -> active agents
+  hermes-bots --chats   -> bot chat messages
+  hermes-bots --peers   -> registered Hermes peers
+  hermes-bots --discover -> scan LAN for Hermes peer ports
+  hermes-bots --status  -> local Hermes dashboard summary
+
+Outputs JSON:
+  agents mode:
+    {"active": <int>, "sessions": [...]}
+  chats mode:
+    {"chats": [{"id": "...", "title": "...", "lastActivityAt": <ts>, "messages": [...]}]}
+  peers mode:
+    {"peers": [{"name": "...", "url": "...", "keySet": <bool>}]}
+"""
+import concurrent.futures
+import base64
+import hashlib
+import json
+import os
+import re
+import socket
+import stat
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
+from datetime import datetime
+from pathlib import Path
+
+from hermes_rooms import (
+    add_room_member,
+    create_distributed_room,
+    create_room as create_hosted_room,  # compatibility symbol; LIST never calls it
+    member_descriptors,
+    desktop_rooms,
+    dispatch_native_room,
+    native_status,
+    new_room_id,
+    rename_room,
+    remove_room_member,
+    room_log,
+    room_request,
+    save_clipboard_image,
+    send_room_message,
+)
+
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+HERMES_STATE_DB = str(HERMES_HOME / "state.db")
+PEER_UI_PATH = os.path.expanduser("~/.config/omarchy-hermes/peers.json")
+OMARCHY_DOCS_PATHS = [
+    Path("/usr/share/omarchy/shell/README.md"),
+    Path("/usr/share/omarchy/shell/plugins/README.md"),
+    Path("/usr/share/omarchy/shell/plugins/agents/README.md"),
+]
+OMARCHY_DOCS_SKILL_SOURCE = Path(__file__).resolve().parents[1] / "skills" / "omarchy-docs" / "SKILL.md"
+PREFS_PATH = os.path.expanduser("~/.config/omarchy-hermes/preferences.json")
+DRAFTS_PATH = os.path.expanduser("~/.config/omarchy-hermes/drafts.json")
+ARCHIVE_WATCH_PATH = os.path.expanduser("~/.config/omarchy-hermes/archive-watch.json")
+
+
+def _draft_key(scope, conversation_id):
+    scope = str(scope or "").strip()
+    conversation_id = str(conversation_id or "").strip()
+    if scope not in ("chat", "room") or not conversation_id or len(conversation_id) > 300:
+        raise ValueError("invalid draft identity")
+    return scope + ":" + conversation_id
+
+
+def load_drafts():
+    try:
+        with open(DRAFTS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _write_drafts(drafts):
+    directory = os.path.dirname(DRAFTS_PATH)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".drafts.", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(drafts, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, DRAFTS_PATH)
+        os.chmod(DRAFTS_PATH, 0o600)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def get_draft(scope, conversation_id):
+    return load_drafts().get(_draft_key(scope, conversation_id), {})
+
+
+def save_draft(scope, conversation_id, text="", image=""):
+    drafts = load_drafts()
+    key = _draft_key(scope, conversation_id)
+    text, image = str(text or ""), str(image or "")
+    if text or image:
+        drafts[key] = {"text": text, "image": image, "updatedAt": time.time()}
+    else:
+        drafts.pop(key, None)
+    _write_drafts(drafts)
+    return drafts.get(key, {})
+
+
+def delete_draft(scope, conversation_id):
+    drafts = load_drafts()
+    drafts.pop(_draft_key(scope, conversation_id), None)
+    _write_drafts(drafts)
+
+
+def load_preferences():
+    defaults = {"heightMode": 3, "expanded": True, "showAllDetails": False, "panelPinned": False,
+                "quotaDetailsVisible": False, "headerQuotaVisible": True,
+                "agentSort": "time", "agentFilter": "all", "hiddenVisible": False}
+    try:
+        with open(PREFS_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        mode = int(raw.get("heightMode", defaults["heightMode"]))
+        defaults["heightMode"] = max(0, min(4, mode))
+        defaults["expanded"] = bool(raw.get("expanded", defaults["expanded"]))
+        defaults["showAllDetails"] = bool(raw.get("showAllDetails", False))
+        defaults["panelPinned"] = bool(raw.get("panelPinned", False))
+        defaults["quotaDetailsVisible"] = bool(raw.get("quotaDetailsVisible", False))
+        defaults["headerQuotaVisible"] = bool(raw.get("headerQuotaVisible", True))
+        sort = str(raw.get("agentSort", "time"))
+        filt = str(raw.get("agentFilter", "all"))
+        defaults["agentSort"] = sort if sort in ("time", "name") else "time"
+        defaults["agentFilter"] = filt if filt in ("all", "working", "idle") else "all"
+        defaults["hiddenVisible"] = bool(raw.get("hiddenVisible", False))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return defaults
+
+
+def set_preference(key, value):
+    if key not in ("heightMode", "expanded", "showAllDetails", "agentSort", "agentFilter", "hiddenVisible", "panelPinned", "quotaDetailsVisible", "headerQuotaVisible"):
+        raise ValueError("unsupported preference")
+    prefs = load_preferences()
+    if key == "heightMode":
+        prefs[key] = max(0, min(4, int(value)))
+    elif key in ("expanded", "showAllDetails", "hiddenVisible", "panelPinned", "quotaDetailsVisible", "headerQuotaVisible"):
+        prefs[key] = str(value).strip().lower() in ("1", "true", "yes", "on")
+    elif key == "agentSort":
+        prefs[key] = value if value in ("time", "name") else "time"
+    else:
+        prefs[key] = value if value in ("all", "working", "idle") else "all"
+    os.makedirs(os.path.dirname(PREFS_PATH), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".preferences.", dir=os.path.dirname(PREFS_PATH))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, PREFS_PATH)
+        os.chmod(PREFS_PATH, 0o600)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return prefs
+
+
+def list_sessions():
+    """Parse `hermes sessions list` table."""
+    try:
+        result = subprocess.run(
+            ["hermes", "sessions", "list"],
+            capture_output=True, text=True, timeout=15
+        )
+    except Exception:
+        return []
+    lines = result.stdout.splitlines()
+    sessions = []
+    # Header is two lines; data starts at line 3 if present.
+    for line in lines[2:]:
+        line = line.rstrip()
+        if not line:
+            continue
+        # Columns are Title, Workspace, Last Active, ID, separated by 2+ spaces.
+        match = re.match(r"(.+?)\s{2,}(.+?)\s{2,}(.+?)\s{2,}(.+)$", line)
+        if not match:
+            continue
+        title, workspace, last_active, sid = match.groups()
+        sessions.append({
+            "id": sid.strip(),
+            "title": title.strip(),
+            "workspace": workspace.strip(),
+            "lastActive": last_active.strip(),
+        })
+
+    # Enrich with raw timestamps + owning profile + last message preview + working state.
+    try:
+        conn = open_db()
+        conn.row_factory = sqlite3.Row
+        ts = {}
+        prof = {}
+        work = {}
+        for row in conn.execute("SELECT id, last_activity_at, profile_name, ended_at, last_activity_description FROM sessions"):
+            ts[row["id"]] = row["last_activity_at"] or 0
+            prof[row["id"]] = row["profile_name"] or "default"
+            w, act = _session_working_state(row)
+            work[row["id"]] = {"working": w, "activity": act}
+        last_msg = {}
+        for row in conn.execute(
+            """SELECT session_id, content FROM messages
+               WHERE content IS NOT NULL AND TRIM(content) != ''
+                 AND id IN (SELECT MAX(id) FROM messages GROUP BY session_id)"""
+        ):
+            txt = re.sub(r"\s+", " ", str(row[1] or "")).strip()
+            if txt:
+                last_msg[row[0]] = redact(txt[-70:])
+        conn.close()
+        for s in sessions:
+            s["lastActivityTs"] = ts.get(s["id"], 0)
+            s["profile"] = prof.get(s["id"], "")
+            s["profileHue"] = _avatar_hue(s["profile"]) if s["profile"] else -1
+            s["lastMsg"] = redact(last_msg.get(s["id"], ""))
+            s["working"] = work.get(s["id"], {}).get("working", False)
+            s["activity"] = work.get(s["id"], {}).get("activity", "")
+    except Exception:
+        for s in sessions:
+            s["lastActivityTs"] = 0
+            s["profile"] = ""
+            s["profileHue"] = -1
+            s["lastMsg"] = ""
+            s["working"] = False
+            s["activity"] = ""
+    return sessions
+
+
+HERMES_BIN = os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python")
+HERMES_MAIN = os.path.expanduser("~/.hermes/hermes-agent/hermes")
+
+
+def _profile_state_db(profile=""):
+    profile = (profile or "").strip()
+    if not profile or profile == "default":
+        return str(HERMES_HOME / "state.db")
+    return str(HERMES_HOME / "profiles" / profile / "state.db")
+
+
+def open_db(profile=""):
+    """Read-only connection: the gateway may be writing concurrently."""
+    path = _profile_state_db(profile)
+    return sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+
+
+def _load_archive_watch():
+    try:
+        with open(ARCHIVE_WATCH_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _write_archive_watch(watches):
+    directory = os.path.dirname(ARCHIVE_WATCH_PATH)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".archive-watch.", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(watches, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, ARCHIVE_WATCH_PATH)
+        os.chmod(ARCHIVE_WATCH_PATH, 0o600)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _latest_active_message(session_id, profile="default"):
+    try:
+        conn = open_db(profile)
+        row = conn.execute(
+            """SELECT id, timestamp FROM messages WHERE session_id=? AND active=1
+               ORDER BY timestamp DESC, id DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+        conn.close()
+        return {"id": str(row[0]), "timestamp": float(row[1] or 0)} if row else {"id": "", "timestamp": 0}
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return {"id": "", "timestamp": 0}
+
+
+def _archive_watch_key(session_id, profile):
+    return str(profile or "default") + "::" + str(session_id)
+
+
+def record_archive_watch(session_id, profile="default"):
+    """Record the exact message boundary before a UI-driven archive succeeds."""
+    session_id, profile = str(session_id or ""), str(profile or "default")
+    if not session_id:
+        return
+    watches = _load_archive_watch()
+    latest = _latest_active_message(session_id, profile)
+    watches[_archive_watch_key(session_id, profile)] = {
+        "id": session_id,
+        "profile": profile,
+        "lastMessageId": latest["id"],
+        "lastMessageAt": latest["timestamp"],
+    }
+    _write_archive_watch(watches)
+
+
+def unarchive_chats_with_new_messages():
+    """Reopen UI-archived local chats once their transcript advances."""
+    watches = _load_archive_watch()
+    remaining, unarchived = {}, []
+    for key, watch in watches.items():
+        if not isinstance(watch, dict):
+            continue
+        session_id = str(watch.get("id") or "")
+        profile = str(watch.get("profile") or "default")
+        latest = _latest_active_message(session_id, profile)
+        advanced = bool(latest["id"]) and (
+            latest["id"] != str(watch.get("lastMessageId") or "")
+            or latest["timestamp"] > float(watch.get("lastMessageAt") or 0)
+        )
+        if not advanced:
+            remaining[key] = watch
+            continue
+        result = mutate_session(session_id, profile=profile, archived=False)
+        if result.get("ok") is True:
+            unarchived.append({"id": session_id, "profile": profile})
+        else:
+            remaining[key] = watch
+    if remaining != watches:
+        _write_archive_watch(remaining)
+    return {"ok": True, "unarchived": unarchived}
+
+
+_SECRET_PATTERNS = [
+    (re.compile(r"sk-[A-Za-z0-9_\-]{8,}"), "sk-•••"),
+    (re.compile(r"ghp_[A-Za-z0-9]{8,}"), "ghp_•••"),
+    (re.compile(r"gho_[A-Za-z0-9]{8,}"), "gho_•••"),
+    (re.compile(r"AKIA[A-Z0-9]{8,}"), "AKIA•••"),
+    (re.compile(r"Bearer\s+[A-Za-z0-9_\-\.]{8,}"), "Bearer •••"),
+    (re.compile(r"AIza[0-9A-Za-z_\-]{8,}"), "AIza•••"),
+    (re.compile(r"[A-Za-z0-9_\-]{24}\.[A-Za-z0-9_\-]{6}\.[A-Za-z0-9_\-]{27}"), "•••jwt•••"),
+]
+
+
+def redact(text):
+    if not text:
+        return text
+    text = str(text)
+    for pat, rep in _SECRET_PATTERNS:
+        text = pat.sub(rep, text)
+    return text
+
+
+def running_hermes_procs():
+    """Return {sessionId: pid} for `hermes --resume <id>` processes."""
+    try:
+        result = subprocess.run(
+            ["ps", "aux"], capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return {}
+
+    mapping = {}
+    for line in result.stdout.splitlines():
+        if "hermes" not in line or "--resume" not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        m = re.search(r"--resume\s+(\S+)", line)
+        if m:
+            mapping[m.group(1)] = pid
+    return mapping
+
+
+_IMG_TOKEN = "\x00"
+
+
+def _stash_img(src, tokens, max_width=340):
+    import html as _html
+    src = _html.escape(src.strip(), quote=True)
+    if src.startswith("/"):
+        src = "file://" + src
+    tokens.append('<img src="%s" width="%d">' % (src, max_width))
+    return "%s%d%s" % (_IMG_TOKEN, len(tokens) - 1, _IMG_TOKEN)
+
+
+def _inline_md(text, tokens):
+    """Inline markdown -> HTML subset on already-escaped-ish text."""
+    import html as _html
+    out = _html.escape(text)
+    out = re.sub(r'`([^`]+)`', r'<font face="monospace">\1</font>', out)
+    out = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', out)
+    out = re.sub(r'(?<!\w)__([^_]+)__(?!\w)', r'<b>\1</b>', out)
+    out = re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'<i>\1</i>', out)
+    out = re.sub(r'(?<!\w)_([^_\n]+)_(?!\w)', r'<i>\1</i>', out)
+    out = re.sub(r'~~([^~]+)~~', r'<s>\1</s>', out)
+    # links: [text](url) -> anchor
+    out = re.sub(r'\[([^\]]+)\]\(([^)\s]+)\)',
+                 lambda m: '<a href="%s">%s</a>' % (_html.escape(m.group(2), quote=True), m.group(1)),
+                 out)
+    return out
+
+
+def md_to_html(text):
+    """Convert Hermes markdown content to the HTML subset Text.RichText renders.
+
+    Block-level: fenced code, headings, lists, tables, blockquotes, hr, paragraphs.
+    Inline: images (![](...) and MEDIA:path -> <img>), code, bold, italic,
+    strikethrough, links.
+    """
+    if not text:
+        return ""
+
+    tokens = []
+
+    # 1. Extract images before any escaping (raw text scan).
+    def _img_ref(m):
+        return _stash_img(m.group(2), tokens)
+    text = re.sub(r'!\[([^\]]*)\]\(([^)\s]+)\)', _img_ref, text)
+    text = re.sub(r'MEDIA:([^\s<&`]+)', lambda m: _stash_img(m.group(1), tokens), text)
+
+    lines = text.split("\n")
+    out = []
+    i = 0
+    in_code = False
+    code_buf = []
+    code_lang = ""
+    list_buf = []      # (ordered?, item_html)
+    table_buf = []     # raw rows
+
+    def flush_list():
+        nonlocal list_buf
+        if not list_buf:
+            return
+        ordered = list_buf[0][0]
+        tag = "ol" if ordered else "ul"
+        items = "".join("<li>%s</li>" % it for _, it in list_buf)
+        out.append("<%s>%s</%s>" % (tag, items, tag))
+        list_buf = []
+
+    def flush_table():
+        nonlocal table_buf
+        if len(table_buf) < 2:
+            for r in table_buf:
+                out.append("<p>%s</p>" % _inline_md(r.strip("| ").replace("|", " | "), tokens))
+            table_buf = []
+            return
+        def cells(row):
+            return [c.strip() for c in row.strip().strip("|").split("|")]
+        header = cells(table_buf[0])
+        body = [cells(r) for r in table_buf[2:]]  # skip separator row
+        t = ['<table border="0" cellspacing="0">']
+        t.append("<tr>" + "".join("<td><b>%s</b></td>" % _inline_md(h, tokens) for h in header) + "</tr>")
+        for row in body:
+            t.append("<tr>" + "".join("<td>%s</td>" % _inline_md(c, tokens) for c in row) + "</tr>")
+        t.append("</table>")
+        out.append("".join(t))
+        table_buf = []
+
+    import html as _html
+    for raw in lines:
+        line = raw.rstrip()
+        fence = re.match(r"^```(\w*)\s*$", line)
+        if fence:
+            if in_code:
+                out.append(
+                '<p style="background-color:rgba(0,0,0,0.18); margin:0; padding:6px;">'
+                    "<font face=\"monospace\">%s</font></p>" % _html.escape("\n".join(code_buf))
+                )
+                code_buf = []
+                in_code = False
+            else:
+                flush_list(); flush_table()
+                in_code = True
+                code_lang = fence.group(1)
+            continue
+        if in_code:
+            code_buf.append(raw)
+            continue
+
+        if not line.strip():
+            flush_list(); flush_table()
+            continue
+
+        # table row?
+        if line.lstrip().startswith("|") and line.rstrip().endswith("|"):
+            flush_list()
+            table_buf.append(line)
+            continue
+        else:
+            flush_table()
+
+        h = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if h:
+            flush_list()
+            level = min(len(h.group(1)), 4)
+            out.append("<h%d>%s</h%d>" % (level, _inline_md(h.group(2), tokens), level))
+            continue
+
+        if re.match(r"^\s*([-*_])\s*\1\s*\1[\s\-*_.]*$", line):
+            flush_list()
+            out.append("<hr>")
+            continue
+
+        bq = re.match(r"^>\s?(.*)$", line)
+        if bq:
+            flush_list()
+            out.append('<p style="margin-left:16px; font-style:italic;"><i>%s</i></p>'
+                       % _inline_md(bq.group(1), tokens))
+            continue
+
+        ul = re.match(r"^\s*[-*+]\s+(.*)$", line)
+        ol = re.match(r"^\s*\d+[.)]\s+(.*)$", line)
+        if ul or ol:
+            m = ul or ol
+            ordered = ol is not None
+            if list_buf and list_buf[0][0] != ordered:
+                flush_list()
+            list_buf.append((ordered, _inline_md(m.group(1), tokens)))
+            continue
+
+        flush_list()
+        out.append("<p>%s</p>" % _inline_md(line, tokens))
+
+    if in_code and code_buf:
+        out.append(
+        '<p style="background-color:rgba(0,0,0,0.18); margin:0; padding:6px;">'
+            "<font face=\"monospace\">%s</font></p>" % _html.escape("\n".join(code_buf))
+        )
+    flush_list()
+    flush_table()
+
+    html = "<br>".join(out)
+    for idx, tag in enumerate(tokens):
+        html = html.replace("%s%d%s" % (_IMG_TOKEN, idx, _IMG_TOKEN), tag)
+    return html
+
+
+
+def list_chats(session_id=None, limit=30, offset=0, profile=""):
+    """Return Hermes sessions that have messages, ordered by recent activity.
+
+    If session_id is given, return only that session (or empty list).
+    Each chat includes a best-guess platform/peer tag.
+    `limit`/`offset` slice the message list per session (offset 0 = most recent).
+    """
+    if session_id is None and not profile:
+        names = ["default"]
+        profile_root = HERMES_HOME / "profiles"
+        if profile_root.is_dir():
+            names.extend(sorted(
+                path.name for path in profile_root.iterdir()
+                if path.is_dir()
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", path.name)
+                and (path / "state.db").is_file()
+            ))
+        combined = []
+        for name in names:
+            combined.extend(list_chats(limit=limit, offset=offset, profile=name)["chats"])
+        combined.sort(key=lambda chat: (-(chat.get("lastActivityAt") or 0), chat.get("id") or ""))
+        return {"chats": combined}
+
+    chats = []
+    db_path = _profile_state_db(profile)
+    if not os.path.isfile(db_path):
+        return {"chats": chats}
+
+    try:
+        conn = open_db(profile)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+
+        if session_id:
+            c.execute(
+                """SELECT id, title, started_at, last_activity_at, message_count, source,
+                          ended_at, last_activity_description, profile_name, last_read_at
+                   FROM sessions WHERE id=?""",
+                (session_id,),
+            )
+        else:
+            c.execute(
+                """SELECT id, title, started_at, last_activity_at, message_count, source,
+                          ended_at, last_activity_description, profile_name, last_read_at
+                   FROM sessions
+                   WHERE message_count > 0
+                   ORDER BY last_activity_at DESC"""
+            )
+
+        for row in c.fetchall():
+            sid = row["id"]
+            c2 = conn.cursor()
+            # Order newest first so offset/limit work from the end.
+            c2.execute(
+                """SELECT id, role, content, timestamp, tool_calls, tool_name,
+                          display_kind, reasoning_content, display_metadata
+                   FROM messages
+                   WHERE session_id=? AND active=1
+                   ORDER BY timestamp DESC
+                   LIMIT ? OFFSET ?""",
+                (sid, limit, offset),
+            )
+            messages = []
+            live_thinking = ""
+            for m in c2.fetchall():
+                content = m["content"] or ""
+                if m["role"] == "tool" and content.startswith("{"):
+                    try:
+                        parsed = json.loads(content)
+                        content = parsed.get("output", content)
+                    except Exception:
+                        pass
+                # Tool outputs can be huge — keep chips compact.
+                if m["role"] == "tool" and len(content) > 300:
+                    content = content[:300] + " …"
+                reasoning = (m["reasoning_content"] or "").strip()
+                if not live_thinking and m["role"] == "assistant" and reasoning:
+                    normalized_thinking = reasoning.strip()
+                    if normalized_thinking.lower() not in ("pass", "(pass)"):
+                        live_thinking = normalized_thinking[:4096]
+                author = ""
+                if m["display_metadata"]:
+                    try:
+                        author = json.loads(m["display_metadata"]).get("profile", "")
+                    except Exception:
+                        author = ""
+                messages.append({
+                    "id": m["id"],
+                    "role": m["role"],
+                    "content": content,
+                    "html": md_to_html(content),
+                    "timestamp": m["timestamp"],
+                    "time": time.strftime("%H:%M", time.localtime(m["timestamp"])),
+                    "date": time.strftime("%d %b", time.localtime(m["timestamp"])),
+                    "toolName": m["tool_name"] or "",
+                    "hidden": m["display_kind"] == "hidden",
+                    "thinking": md_to_html(reasoning[:800]) if reasoning else "",
+                    "author": author,
+                })
+            # Return chronological order.
+            messages.reverse()
+
+            source = row["source"]
+            platform = source
+            peer = "host" if source == "api_server" else None
+            working, activity = _session_working_state(row)
+            la = row["last_activity_at"] or 0
+            lr = row["last_read_at"] or 0
+            chats.append({
+                "id": sid,
+                "session_id": sid,
+                "title": row["title"] or ("Bot Chat" if source == "api_server" else "Chat"),
+                "startedAt": row["started_at"],
+                "lastActivityAt": la,
+                "messageCount": row["message_count"],
+                "messages": messages,
+                "platform": platform,
+                "peer": peer,
+                "limit": limit,
+                "offset": offset,
+                "working": working,
+                "activity": activity,
+                "liveThinking": live_thinking if working else "",
+                "liveThinkingHtml": md_to_html(live_thinking) if working and live_thinking else "",
+                "profile": profile or row["profile_name"] or "default",
+                "unread": bool(la and la > lr),
+            })
+
+        conn.close()
+    except Exception:
+        pass
+
+    return {"chats": chats}
+
+
+def _read_env_values(path=None):
+    """Read the Hermes env without ever returning/printing it wholesale."""
+    values = {}
+    path = path or os.path.expanduser("~/.hermes/.env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip().strip("\"'")
+    except Exception:
+        pass
+    return values
+
+
+def _set_env_value(key, value, path=None):
+    """Atomically set one Hermes env value without exposing its contents."""
+    path = path or os.path.expanduser("~/.hermes/.env")
+    lines = []
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except Exception:
+        pass
+    replacement = f"{key}={value}"
+    found = False
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*" + re.escape(key) + r"\s*=", line):
+            lines[i] = replacement
+            found = True
+    if not found:
+        lines.append(replacement)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".env.", text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _peer_ui_metadata():
+    try:
+        with open(PEER_UI_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_peer_ui_metadata(data):
+    directory = os.path.dirname(PEER_UI_PATH)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix="peers.", suffix=".json", text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, PEER_UI_PATH)
+        os.chmod(PEER_UI_PATH, 0o600)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def set_peer_title(name, title):
+    """Set a display-only peer alias without changing its routing identity."""
+    if name not in _configured_peers():
+        return {"ok": False, "error": "unknown peer"}
+    title = re.sub(r"[\x00-\x1f\x7f]", "", str(title or "")).strip()[:64]
+    data = _peer_ui_metadata()
+    row = data.get(name) if isinstance(data.get(name), dict) else {}
+    if title:
+        row["title"] = title
+        data[name] = row
+    else:
+        row.pop("title", None)
+        if row:
+            data[name] = row
+        else:
+            data.pop(name, None)
+    _write_peer_ui_metadata(data)
+    return {"ok": True, "name": name, "title": title}
+
+
+def set_peer_agent_title(name, profile, title):
+    """Persist a display-only alias for one remote profile."""
+    if name not in _configured_peers():
+        return {"ok": False, "error": "unknown peer"}
+    profile = str(profile or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", profile):
+        return {"ok": False, "error": "invalid profile"}
+    title = re.sub(r"[\x00-\x1f\x7f]", "", str(title or "")).strip()[:64]
+    data = _peer_ui_metadata()
+    row = data.get(name) if isinstance(data.get(name), dict) else {}
+    agents = row.get("agents") if isinstance(row.get("agents"), dict) else {}
+    if title:
+        agents[profile] = {"title": title}
+    else:
+        agents.pop(profile, None)
+    if agents:
+        row["agents"] = agents
+    else:
+        row.pop("agents", None)
+    if row:
+        data[name] = row
+    else:
+        data.pop(name, None)
+    _write_peer_ui_metadata(data)
+    return {"ok": True, "name": name, "profile": profile, "title": title}
+
+
+def _peer_display_title(name, is_local=False):
+    row = _peer_ui_metadata().get(name)
+    if isinstance(row, dict) and str(row.get("title") or "").strip():
+        return str(row["title"]).strip()
+    return "Local" if is_local else name.replace("-", " ").title()
+
+
+def set_lan_access(enabled):
+    """Opt this gateway into/out of LAN access, preserving a strong API key."""
+    env = _read_env_values()
+    if enabled and not env.get("API_SERVER_KEY"):
+        import secrets
+        _set_env_value("API_SERVER_KEY", secrets.token_urlsafe(36))
+    _set_env_value("API_SERVER_ENABLED", "true")
+    _set_env_value("API_SERVER_HOST", "0.0.0.0" if enabled else "127.0.0.1")
+    result = subprocess.run(
+        ["systemctl", "--user", "restart", "hermes-gateway"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return {"ok": result.returncode == 0, "lanAccess": bool(enabled),
+            "status": "LAN enabled" if enabled else "Local only"}
+
+
+def _configured_peers():
+    """Read bot_peers URL entries from config.yaml (stdlib, narrow parser)."""
+    path = os.path.expanduser("~/.hermes/config.yaml")
+    peers = {}
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+        in_peers = False
+        current = None
+        base_indent = 0
+        for raw in lines:
+            if not in_peers:
+                if re.match(r"^bot_peers:\s*$", raw):
+                    in_peers, base_indent = True, len(raw) - len(raw.lstrip())
+                continue
+            if raw.strip() and len(raw) - len(raw.lstrip()) <= base_indent:
+                break
+            m = re.match(r"^\s{%d}(\S[^:]*):\s*$" % (base_indent + 2), raw)
+            if m:
+                current = m.group(1).strip().strip("\"'")
+                peers[current] = {}
+                continue
+            m = re.match(r"^\s+url:\s*(.*?)\s*$", raw)
+            if m and current:
+                peers[current]["url"] = m.group(1).strip().strip("\"'").rstrip("/")
+    except Exception:
+        pass
+    return peers
+
+
+def _peer_key(name, env):
+    slug = name.upper().replace("-", "_")
+    return env.get(f"HERMES_PEER_{slug}_KEY", "")
+
+
+def _peer_json(url, path, key, timeout=2.0, method="GET", body=None):
+    data = None
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        url.rstrip("/") + path,
+        data=data,
+        method=method,
+        headers=headers,
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+_REMOTE_PREFIX = "remote::"
+_REMOTE_COLORS = ("#BF5AF2", "#5E5CE6", "#64D2FF", "#FF9F0A", "#FF375F", "#30D158")
+
+
+def _remote_color(identity):
+    digest = hashlib.sha256(str(identity).encode("utf-8")).digest()
+    return _REMOTE_COLORS[digest[0] % len(_REMOTE_COLORS)]
+
+
+def _remote_ref(peer, profile, session_id):
+    """Globally unique identity for one conversation in the gateway mesh."""
+    return _REMOTE_PREFIX + peer + "::" + profile + "::" + session_id
+
+
+def _parse_remote_ref(value):
+    if not str(value).startswith(_REMOTE_PREFIX):
+        return None
+    parts = str(value)[len(_REMOTE_PREFIX):].split("::", 2)
+    return tuple(parts) if len(parts) == 3 and all(parts) else None
+
+
+def _relative_time(timestamp):
+    try:
+        age = max(0, time.time() - float(timestamp or 0))
+    except Exception:
+        return ""
+    if age < 60:
+        return "ahora"
+    if age < 3600:
+        return "%dm" % int(age // 60)
+    if age < 86400:
+        return "%dh" % int(age // 3600)
+    return "%dd" % int(age // 86400)
+
+
+def _peer_profile_rows(url, key):
+    try:
+        payload = _peer_json(url, "/v1/profiles", key, 3.0)
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return []
+
+
+_PEER_CONTROL_SOCKET = os.path.expanduser("~/.local/share/ares-peer/control.sock")
+_PEER_MAX_RESPONSE = 1024 * 1024
+_PEER_MAX_SESSION_ROWS = 10000
+
+
+def _peer_control_json(request):
+    """Bounded request to the owner's paired peer service; no direct remote trust."""
+    path = _PEER_CONTROL_SOCKET
+    directory = os.path.dirname(path)
+    parent = os.stat(directory)
+    info = os.lstat(path)
+    if (parent.st_uid != os.getuid() or parent.st_mode & 0o077
+            or info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode)
+            or info.st_mode & 0o077):
+        raise ValueError("unsafe peer control socket")
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(2.0)
+        client.connect(path)
+        client.sendall(json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n")
+        deadline = time.monotonic() + 2.0
+        data = bytearray()
+        while len(data) <= _PEER_MAX_RESPONSE:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("peer control response timed out")
+            client.settimeout(remaining)
+            part = client.recv(min(8192, _PEER_MAX_RESPONSE + 1 - len(data)))
+            if not part:
+                break
+            data.extend(part)
+            if b"\n" in part:
+                break
+    if len(data) > _PEER_MAX_RESPONSE or not data.endswith(b"\n") or data.count(b"\n") != 1:
+        raise ValueError("incomplete peer control response")
+    return json.loads(data)
+
+
+def _source_path(value):
+    """The source verified existence; validate syntax, never stat a remote path here."""
+    if (not isinstance(value, str) or not value.startswith("/") or "\x00" in value
+            or len(value) > 4096 or any(part in (".", "..") for part in value.split("/"))):
+        return ""
+    return value
+
+
+def _paired_session_paths(peer, profile):
+    """Return exact source IDs and paths, or no assertions on any failed page."""
+    paths = {}
+    offset = 0
+    while offset < _PEER_MAX_SESSION_ROWS:
+        response = _peer_control_json({"op": "rpc", "peer": peer, "request":
+            {"op": "sessions", "profile": profile, "limit": min(100, _PEER_MAX_SESSION_ROWS - offset), "offset": offset}})
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            return {}
+        result = response.get("result")
+        if (not isinstance(result, dict) or not isinstance(result.get("data"), list)
+                or type(result.get("has_more")) is not bool
+                or len(result["data"]) > min(100, _PEER_MAX_SESSION_ROWS - offset)):
+            return {}
+        for row in result["data"]:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                return {}
+            sid = row["id"]
+            if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", sid)
+                    or row.get("profile") != profile or sid in paths
+                    or type(row.get("archived", False)) is not bool
+                    or not isinstance(row.get("cwd", ""), str)
+                    or not isinstance(row.get("git_repo_root", ""), str)):
+                return {}
+            # A malformed claimed path invalidates the whole source response.
+            for field in ("cwd", "git_repo_root"):
+                value = row.get(field, "")
+                if value and not _source_path(value):
+                    return {}
+            paths[sid] = _source_path(row.get("git_repo_root")) or _source_path(row.get("cwd"))
+        if not result["has_more"]:
+            return paths
+        if not result["data"]:
+            return {}
+        offset += len(result["data"])
+    # Incomplete catalog cannot assert workspace identity.
+    return {}
+
+
+def _remote_sessions_for_peer(peer, entry, env):
+    """Recent conversations from every readable profile on one peer."""
+    url = entry.get("url", "")
+    key = _peer_key(peer, env)
+    if not url or not key or not probe_peer(url, timeout=0.8, key=key).get("authenticated"):
+        return []
+    profiles = _peer_profile_rows(url, key)
+    if not profiles:
+        profiles = [{"profile": "default", "title": peer.replace("-", " ").title()}]
+    out = []
+    for agent in profiles:
+        profile = str(agent.get("profile") or "default").strip()
+        if not re.match(r"^[a-zA-Z0-9_-]+$", profile):
+            continue
+        base_path = "" if profile == "default" else "/p/" + urllib.parse.quote(profile, safe="")
+        rows = []
+        try:
+            # Recent cron/Telegram rows have no cwd and can fill the first page.
+            # Bound reads per profile; keep the peer's own workspace identity.
+            for offset in range(0, 400, 100):
+                payload = _peer_json(
+                    url,
+                    base_path + f"/api/sessions?limit=100&offset={offset}&include_hidden=0&include_workspace=1",
+                    key, 3.0,
+                )
+                page = payload.get("data") if isinstance(payload, dict) else []
+                if not isinstance(page, list) or not page:
+                    break
+                rows.extend(page)
+                if not payload.get("has_more"):
+                    break
+        except Exception:
+            # Named profiles may deliberately retain profile-scoped API keys.
+            continue
+        try:
+            paired_paths = _paired_session_paths(peer, profile)
+        except (OSError, ValueError, UnicodeError, TypeError):
+            paired_paths = {}
+        seen_sessions = set()
+        for row in rows:
+            sid = row.get("id") if isinstance(row, dict) else None
+            if not isinstance(sid, str) or not sid or sid in seen_sessions:
+                continue
+            seen_sessions.add(sid)
+            if int(row.get("message_count") or 0) <= 0:
+                continue
+            ts = float(row.get("last_active") or row.get("started_at") or 0)
+            working = row.get("ended_at") is None and ts > 0 and time.time() - ts < 180
+            identity = peer + "/" + profile
+            peer_title = _peer_display_title(peer)
+            peer_meta = _peer_ui_metadata().get(peer)
+            aliases = peer_meta.get("agents", {}) if isinstance(peer_meta, dict) else {}
+            alias_row = aliases.get(profile) if isinstance(aliases, dict) else None
+            agent_title = str(alias_row.get("title") or "").strip() if isinstance(alias_row, dict) else ""
+            out.append({
+                "id": _remote_ref(peer, profile, sid),
+                "remoteSessionId": sid,
+                "remote": True,
+                "peer": peer,
+                "peerTitle": peer_title,
+                "identity": identity,
+                "profile": identity,
+                "profileHue": _avatar_hue(identity),
+                "avatarColor": _remote_color(identity),
+                "agentTitle": agent_title or str(agent.get("title") or ("Hermes" if profile == "default" else profile.title())),
+                "avatarShape": "diamond" if profile == "default" else "triangle",
+                "title": redact(str(row.get("title") or "Chat")),
+                "workspacePath": paired_paths.get(sid, ""),
+                "externalArchived": False,
+                "workspace": peer_title + " · @" + peer + "/" + profile,
+                "lastActive": _relative_time(ts),
+                "lastActivityTs": ts,
+                "lastMsg": redact(str(row.get("preview") or "")),
+                "working": working,
+                "activity": "remote agent working" if working else "",
+                "messageCount": int(row.get("message_count") or 0),
+                "model": str(agent.get("model") or row.get("model") or ""),
+                "provider": str(agent.get("provider") or ""),
+            })
+    return out
+
+
+def _paired_aliases():
+    """Only the private owner's pairing roster, never unauthenticated discovery."""
+    try:
+        response = _peer_control_json({"op": "status"})
+    except (OSError, ValueError, UnicodeError, TypeError):
+        return []
+    result = response.get("result") if isinstance(response, dict) and response.get("ok") is True else None
+    aliases = result.get("trusted") if isinstance(result, dict) else None
+    if (not isinstance(aliases, list) or len(aliases) > 64
+            or any(not isinstance(a, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", a)
+                   for a in aliases) or len(set(aliases)) != len(aliases)):
+        return []
+    return aliases
+
+
+def _paired_session_rows(peer):
+    """Read an all-or-nothing bounded catalog from an authenticated source."""
+    profile = "default"  # The service does not advertise named profile identities.
+    catalog = []
+    seen = set()
+    offset = 0
+    while offset < _PEER_MAX_SESSION_ROWS:
+        response = _peer_control_json({"op": "rpc", "peer": peer, "request":
+            {"op": "sessions", "profile": profile, "limit": min(100, _PEER_MAX_SESSION_ROWS - offset), "offset": offset}})
+        result = response.get("result") if isinstance(response, dict) and response.get("ok") is True else None
+        if (not isinstance(result, dict) or not isinstance(result.get("data"), list)
+                or type(result.get("has_more")) is not bool
+                or len(result["data"]) > min(100, _PEER_MAX_SESSION_ROWS - offset)):
+            return []
+        page = result["data"]
+        for row in page:
+            if not isinstance(row, dict):
+                return []
+            sid = row.get("id")
+            if (not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", sid)
+                    or sid in seen or row.get("profile") != profile
+                    or not isinstance(row.get("title", ""), str)
+                    or type(row.get("message_count")) is not int or row["message_count"] < 0
+                    or type(row.get("archived", False)) is not bool
+                    or not isinstance(row.get("cwd", ""), str)
+                    or not isinstance(row.get("git_repo_root", ""), str)):
+                return []
+            if any(row.get(field) and not _source_path(row[field]) for field in ("cwd", "git_repo_root")):
+                return []
+            seen.add(sid)
+            catalog.append(row)
+        if not result["has_more"]:
+            break
+        if not page:
+            return []
+        offset += len(page)
+    else:
+        return []  # Never publish a truncated catalog or provisional paths.
+    identity = peer + "/" + profile
+    peer_title = _peer_display_title(peer)
+    out = []
+    for row in catalog:
+        if row["message_count"] <= 0:
+            continue
+        try:
+            ts = float(row.get("last_activity_at") or row.get("started_at") or 0)
+            if not 0 <= ts < 1e12:
+                return []
+        except (ValueError, TypeError, OverflowError):
+            return []
+        out.append({
+            "id": _remote_ref(peer, profile, row["id"]),
+            "remoteSessionId": row["id"], "remote": True,
+            "peer": peer, "peerTitle": peer_title, "identity": identity,
+            "profile": identity, "profileHue": _avatar_hue(identity),
+            "avatarColor": _remote_color(identity), "agentTitle": "Hermes",
+            "avatarShape": "diamond", "title": redact(row.get("title") or "Chat"),
+            "workspacePath": (_source_path(row.get("git_repo_root"))
+                              or _source_path(row.get("cwd"))),
+            "workspace": peer_title + " · @" + identity,
+            "lastActive": _relative_time(ts), "lastActivityTs": ts,
+            "lastMsg": "", "working": False, "activity": "",
+            "messageCount": row["message_count"], "model": "", "provider": "",
+            "externalArchived": row.get("archived", False),
+        })
+    return out
+
+
+def list_remote_sessions():
+    env = _read_env_values()
+    peers = []
+    gateway_entries = (_configured_peers().items()
+                       if os.environ.get("ARES_LEGACY_GATEWAY_IMPORT") == "1" else ())
+    for name, entry in gateway_entries:
+        host = urllib.parse.urlparse(entry.get("url", "")).hostname or ""
+        if host in ("127.0.0.1", "localhost", "::1"):
+            continue
+        peers.append((name, entry))
+    rows = {}
+    if peers:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(peers))) as pool:
+            jobs = [pool.submit(_remote_sessions_for_peer, n, e, env) for n, e in peers]
+            for job in jobs:
+                try:
+                    for row in job.result(timeout=6):
+                        row["externalArchived"] = False
+                        rows.setdefault(row["id"], row)
+                except Exception:
+                    pass
+    for alias in _paired_aliases():
+        try:
+            paired_rows = _paired_session_rows(alias)
+        except (OSError, ValueError, UnicodeError, TypeError):
+            continue
+        for row in paired_rows:
+            existing = rows.get(row["id"])
+            if existing is None:
+                rows[row["id"]] = row
+            else:
+                # Source-verified identity wins; gateway-only conversations remain.
+                existing.update(row)
+    # Only an authenticated paired catalog can assert source archive state.
+    for row in rows.values():
+        if type(row.get("externalArchived")) is not bool:
+            row["externalArchived"] = False
+    return sorted(rows.values(), key=lambda row: row.get("lastActivityTs", 0), reverse=True)
+
+
+def remote_session_chat(session_ref, limit=30, offset=0):
+    parsed = _parse_remote_ref(session_ref)
+    if not parsed:
+        return {"chats": []}
+    peer, profile, sid = parsed
+    entry = _configured_peers().get(peer) or {}
+    url = entry.get("url", "")
+    key = _peer_key(peer, _read_env_values())
+    if not url or not key:
+        return {"chats": []}
+    base_path = "" if profile == "default" else "/p/" + urllib.parse.quote(profile, safe="")
+    sid_path = urllib.parse.quote(sid, safe="")
+    try:
+        metadata = _peer_json(url, base_path + "/api/sessions/" + sid_path, key, 4.0)
+        session = metadata.get("session") if isinstance(metadata, dict) else {}
+        payload = _peer_json(
+            url,
+            base_path + "/api/sessions/" + sid_path + "/messages?" + urllib.parse.urlencode({
+                "limit": max(1, min(int(limit), 100)), "offset": max(0, int(offset)), "order": "latest",
+            }),
+            key, 5.0,
+        )
+        messages = []
+        for item in payload.get("data") or []:
+            content = item.get("content") or ""
+            if item.get("role") == "tool" and len(content) > 300:
+                content = content[:300] + " …"
+            reasoning = str(item.get("reasoning_content") or item.get("reasoning") or "").strip()
+            ts = float(item.get("timestamp") or 0)
+            messages.append({
+                "id": item.get("id") or "",
+                "role": item.get("role") or "assistant", "content": content,
+                "html": md_to_html(content),
+                "timestamp": ts,
+                "time": time.strftime("%H:%M", time.localtime(ts)) if ts else "",
+                "date": time.strftime("%d %b", time.localtime(ts)) if ts else "",
+                "toolName": item.get("tool_name") or "",
+                "tool_name": item.get("tool_name") or "",
+                "tool_call_id": item.get("tool_call_id") or "",
+                "tool_calls": item.get("tool_calls") or [],
+                "display_kind": item.get("display_kind") or "",
+                "token_count": item.get("token_count"),
+                "hidden": item.get("display_kind") == "hidden",
+                "thinking": md_to_html(reasoning[:800]) if reasoning else "",
+                "reasoning_content": reasoning,
+                "author": peer + "/" + profile,
+            })
+        total = int(session.get("message_count") or len(messages))
+        ts = float(session.get("last_active") or max((item.get("timestamp") or 0 for item in messages), default=0))
+        working = session.get("ended_at") is None and ts > 0 and time.time() - ts < 180
+        return {"chats": [{
+            "id": session_ref, "session_id": session_ref,
+            "remoteSessionId": sid, "remote": True, "peer": peer, "profile": peer + "/" + profile,
+            "title": str(session.get("title") or "Chat"), "messageCount": total,
+            "messages": messages, "platform": "peer", "limit": limit, "offset": offset,
+            "working": working, "activity": "remote agent working" if working else "",
+            "lastActivityTs": ts,
+            "unread": False,
+        }]}
+    except Exception as exc:
+        return {"chats": [], "error": redact(str(exc))[:240]}
+
+
+def send_remote_session(session_ref, text, image=None):
+    parsed = _parse_remote_ref(session_ref)
+    if not parsed:
+        return {"ok": False, "error": "invalid remote session"}
+    peer, profile, sid = parsed
+    entry = _configured_peers().get(peer) or {}
+    url = entry.get("url", "")
+    key = _peer_key(peer, _read_env_values())
+    base_path = "" if profile == "default" else "/p/" + urllib.parse.quote(profile, safe="")
+    try:
+        message = text
+        if image:
+            path = os.path.abspath(os.path.expanduser(image))
+            ext = os.path.splitext(path)[1].lower()
+            mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp"}.get(ext)
+            if not mime or not os.path.isfile(path) or os.path.getsize(path) > 10 * 1024 * 1024:
+                return {"ok": False, "error": "unsupported, missing, or oversized remote image"}
+            with open(path, "rb") as handle:
+                data_url = "data:" + mime + ";base64," + base64.b64encode(handle.read()).decode("ascii")
+            message = [
+                {"type": "text", "text": text or "Describe esta imagen."},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]
+        _peer_json(url, base_path + "/api/sessions/" + urllib.parse.quote(sid, safe="") + "/chat",
+                   key, 600.0, method="POST", body={"message": message})
+        return {"ok": True, "remote": True, "peer": peer}
+    except Exception as exc:
+        return {"ok": False, "error": redact(str(exc))[:240], "remote": True, "peer": peer}
+
+
+def mutate_session(session_ref, profile="default", title=None, archived=None, requester=None):
+    """Rename/archive a local or composite remote session through its gateway."""
+    requester = requester or _peer_json
+    remote = _parse_remote_ref(session_ref)
+    if remote:
+        peer, remote_profile, session_id = remote
+        entry = _configured_peers().get(peer) or {}
+        base = str(entry.get("url") or "")
+        key = _peer_key(peer, _read_env_values())
+        profile = remote_profile
+    else:
+        session_id = str(session_ref or "").strip()
+        base = "http://127.0.0.1:8642"
+        key = _read_env_values().get("API_SERVER_KEY", "")
+    if not session_id or not base or not key:
+        return {"ok": False, "error": "session gateway is unavailable"}
+    prefix = "" if not profile or profile == "default" else "/p/" + urllib.parse.quote(profile, safe="")
+    body = {}
+    if title is not None:
+        body["title"] = str(title).strip()
+    if archived is not None:
+        body["archived"] = bool(archived)
+    if not body:
+        return {"ok": False, "error": "no session change requested"}
+    try:
+        requester(base, prefix + "/api/sessions/" + urllib.parse.quote(session_id, safe=""),
+                  key, 6.0, method="PATCH", body=body)
+        readback = requester(base, prefix + "/api/sessions/" + urllib.parse.quote(session_id, safe=""),
+                             key, 6.0, method="GET")
+        session = readback.get("session", readback.get("data", readback))
+        if not isinstance(session, dict) or str(session.get("id") or session_id) != session_id:
+            return {"ok": False, "error": "session mutation readback failed", "remote": bool(remote)}
+        if archived is not None and bool(session.get("archived")) != bool(archived):
+            return {"ok": False, "error": "session archive readback mismatch", "remote": bool(remote)}
+        return {"ok": True, "session": session,
+                "remote": bool(remote), "archived": body.get("archived")}
+    except Exception as exc:
+        return {"ok": False, "error": redact(str(exc))[:240], "remote": bool(remote)}
+
+
+def ensure_local_bot_chat(profile):
+    """Find or create a profile's canonical Bot Chat through the local gateway."""
+    profile = (profile or "default").strip()
+    if not re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", profile):
+        return {"ok": False, "error": "invalid profile"}
+    env = _read_env_values()
+    key = env.get("API_SERVER_KEY", "")
+    if not key:
+        return {"ok": False, "error": "local API server key is not configured"}
+    base = "http://127.0.0.1:8642"
+    if profile != "default":
+        profile_env = os.path.expanduser(f"~/.hermes/profiles/{profile}/.env")
+        profile_values = _read_env_values(profile_env)
+        if profile_values.get("API_SERVER_KEY") != key:
+            _set_env_value("API_SERVER_KEY", key, profile_env)
+        base += "/p/" + urllib.parse.quote(profile, safe="")
+    query = urllib.parse.urlencode({"limit": 200, "title": "Bot Chat", "include_hidden": 1})
+    try:
+        listing = _peer_json(base, "/api/sessions?" + query, key, 4.0)
+        for session in listing.get("data") or []:
+            if isinstance(session, dict) and str(session.get("title") or "").strip() == "Bot Chat":
+                return {"ok": True, "sessionId": str(session.get("id") or ""),
+                        "profile": profile}
+        created = _peer_json(
+            base, "/api/sessions", key, 6.0, method="POST",
+            body={"title": "Bot Chat", "source": "bot_peer_dm"},
+        )
+        session = created.get("session") if isinstance(created.get("session"), dict) else created
+        sid = str(session.get("id") or session.get("session_id") or "")
+        return {"ok": bool(sid), "sessionId": sid, "profile": profile}
+    except Exception as exc:
+        return {"ok": False, "error": redact(str(exc))[:240], "profile": profile}
+
+
+def create_local_chat(profile):
+    """Create a distinct local conversation for a profile through its gateway."""
+    profile = (profile or "default").strip()
+    if not re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", profile):
+        return {"ok": False, "error": "invalid profile"}
+    env = _read_env_values()
+    key = env.get("API_SERVER_KEY", "")
+    if not key:
+        return {"ok": False, "error": "local API server key is not configured"}
+    base = "http://127.0.0.1:8642"
+    if profile != "default":
+        profile_env = os.path.expanduser(f"~/.hermes/profiles/{profile}/.env")
+        profile_values = _read_env_values(profile_env)
+        if profile_values.get("API_SERVER_KEY") != key:
+            _set_env_value("API_SERVER_KEY", key, profile_env)
+        base += "/p/" + urllib.parse.quote(profile, safe="")
+    try:
+        # The session endpoint rejects duplicate titles. Keep the visible name
+        # useful while making every rail click a distinct conversation.
+        title = "Nuevo chat · " + time.strftime("%Y-%m-%d %H:%M:%S")
+        created = _peer_json(
+            base, "/api/sessions", key, 6.0, method="POST",
+            body={"title": title, "source": "api_server"},
+        )
+        session = created.get("session") if isinstance(created.get("session"), dict) else created
+        sid = str(session.get("id") or session.get("session_id") or "")
+        return {"ok": bool(sid), "sessionId": sid, "profile": profile}
+    except Exception as exc:
+        return {"ok": False, "error": redact(str(exc))[:240], "profile": profile}
+
+
+def probe_peer(url, timeout=1.5, key=""):
+    """Probe a peer and return authenticated health details."""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8642
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+    except Exception:
+        return {"status": "offline", "authenticated": False}
+    try:
+        data = _peer_json(url, "/health/detailed", key, timeout)
+        return {
+            "status": data.get("status", "ok"),
+            "authenticated": True,
+            "activeAgents": int(data.get("active_agents") or 0),
+            "working": bool(data.get("gateway_busy")),
+            "version": str(data.get("version") or ""),
+        }
+    except Exception:
+        try:
+            data = _peer_json(url, "/health", key, timeout)
+            result = {"status": data.get("status", "online"), "authenticated": False,
+                      "activeAgents": 0, "working": False, "version": str(data.get("version") or "")}
+            if key:
+                result["authError"] = "authentication failed"
+            return result
+        except Exception:
+            return {"status": "online", "authenticated": False,
+                    "activeAgents": 0, "working": False, "version": ""}
+
+
+def _peer_agents(name, url, key, health):
+    """Return the authenticated Bot Mode roster exposed by a peer gateway."""
+    rows = []
+    peer_meta = _peer_ui_metadata().get(name)
+    agent_aliases = peer_meta.get("agents", {}) if isinstance(peer_meta, dict) else {}
+    try:
+        payload = _peer_json(url, "/v1/profiles", key, 3.0)
+        profiles = payload.get("data") if isinstance(payload, dict) else []
+        if not isinstance(profiles, list):
+            profiles = []
+        for item in profiles:
+            if not isinstance(item, dict):
+                continue
+            profile = str(item.get("profile") or "").strip()
+            handle = str(item.get("handle") or ("hermes" if profile == "default" else profile)).strip()
+            if not profile or not handle:
+                continue
+            alias_row = agent_aliases.get(profile) if isinstance(agent_aliases, dict) else None
+            alias_title = str(alias_row.get("title") or "").strip() if isinstance(alias_row, dict) else ""
+            rows.append({
+                "profile": profile,
+                "handle": "@" + name + "/" + profile,
+                "target": name if profile == "default" else name + "/" + profile,
+                "title": alias_title or str(item.get("title") or handle.replace("-", " ").title()),
+                "description": str(item.get("description") or ""),
+                "model": str(item.get("model") or ""),
+                "provider": str(item.get("provider") or ""),
+                "avatarHue": _avatar_hue(name + "/" + profile),
+                "avatarColor": _remote_color(name + "/" + profile),
+                "avatarShape": "diamond" if profile == "default" else "triangle",
+                "activeNow": bool(health.get("working")),
+                "working": bool(health.get("working")),
+            })
+    except Exception:
+        pass
+    if rows:
+        return rows
+    # Compatibility with gateways predating /v1/profiles: their main agent is
+    # still fully routable even though named profiles cannot be enumerated.
+    return [{
+        "profile": "default", "handle": "@" + name + "/default", "target": name,
+        "title": name.replace("-", " ").title(), "description": "",
+        "model": "", "provider": "", "avatarHue": _avatar_hue(name),
+        "avatarColor": "", "avatarShape": "oval",
+        "activeNow": bool(health.get("working")), "working": bool(health.get("working")),
+    }]
+
+
+def list_peers():
+    """Return configured gateways and every routable agent on each host."""
+    env = _read_env_values()
+    peers = []
+    for name, entry in _configured_peers().items():
+        url = entry.get("url", "")
+        if not url:
+            continue
+        key = _peer_key(name, env)
+        health = probe_peer(url, key=key)
+        parsed = urllib.parse.urlparse(url)
+        is_local = (parsed.hostname or "") in ("127.0.0.1", "localhost", "::1")
+        dashboard_host = parsed.hostname or "127.0.0.1"
+        dashboard_url = ""
+        try:
+            with socket.create_connection((dashboard_host, 9119), timeout=0.25):
+                dashboard_url = f"http://{dashboard_host}:9119"
+        except Exception:
+            pass
+        local_lan = str(env.get("API_SERVER_HOST") or "127.0.0.1").strip() not in (
+            "127.0.0.1", "localhost", "::1",
+        )
+        agents = _peer_agents(name, url, key, health) if health.get("authenticated") else []
+        # The Local peer is another view of the same local Bot roster. Reuse
+        # that roster's identity fields instead of hashing it as if remote.
+        if is_local and agents:
+            try:
+                local_bots = {b.get("name"): b for b in list_bots(quick=True).get("bots", [])}
+                for agent in agents:
+                    bot = local_bots.get(agent.get("profile"))
+                    if not bot:
+                        continue
+                    agent["title"] = bot.get("title") or agent["title"]
+                    agent["description"] = bot.get("description") or agent["description"]
+                    agent["avatarHue"] = bot.get("avatarHue", agent["avatarHue"])
+                    agent["avatarColor"] = bot.get("avatarColor") or ""
+                    agent["avatarShape"] = bot.get("avatarShape") or agent["avatarShape"]
+            except Exception:
+                pass
+        peers.append({
+            "name": name,
+            "title": _peer_display_title(name, is_local),
+            "handle": "@" + name,
+            "url": url,
+            "keySet": bool(key),
+            "status": health["status"],
+            "authenticated": health.get("authenticated", False),
+            "activeAgents": health.get("activeAgents", 0),
+            "activeNow": health.get("working", False),
+            "working": health.get("working", False),
+            "avatarColor": "#0A84FF" if is_local else "#BF5AF2",
+            "avatarShape": "square" if is_local else "diamond",
+            "version": health.get("version", ""),
+            "local": is_local,
+            "target": name,
+            "dashboardUrl": dashboard_url,
+            "oauthUrl": dashboard_url.rstrip("/") + "/env#section-oauth",
+            "lanAccess": local_lan if is_local else bool(health.get("authenticated")),
+            "agents": agents,
+        })
+    peers.sort(key=lambda p: (not p.get("local"), str(p.get("title") or "").casefold()))
+    return {"peers": peers}
+
+
+def discover_peers(port=8642, timeout=0.4):
+    """Scan the directly-connected IPv4 /24 for Hermes gateways."""
+    discovered = []
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5
+        )
+        m = re.search(r"src\s+(\d+\.\d+\.\d+\.\d+)", result.stdout)
+        if not m:
+            return {"discovered": discovered}
+        local_ip = m.group(1)
+        prefix = ".".join(local_ip.split(".")[:3])
+
+        def probe(ip):
+            try:
+                with socket.create_connection((ip, port), timeout=timeout):
+                    data = urllib.request.urlopen(
+                        f"http://{ip}:{port}/health", timeout=timeout + 0.5
+                    ).read()
+                    health = json.loads(data.decode("utf-8", "replace"))
+                    if health.get("platform") == "hermes-agent":
+                        return {"url": f"http://{ip}:{port}", "ip": ip,
+                                "version": str(health.get("version") or "")}
+            except Exception:
+                pass
+            return None
+
+        ips = [f"{prefix}.{i}" for i in range(1, 255) if f"{prefix}.{i}" != local_ip]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
+            for found in ex.map(probe, ips):
+                if found:
+                    discovered.append(found)
+    except Exception:
+        pass
+    return {"discovered": discovered, "localIp": locals().get("local_ip", "")}
+
+
+def sync_omarchy_docs_skills(profiles=None):
+    """Install the local Omarchy-docs skill into each local Hermes profile.
+
+    The skill is a small pointer to the documentation shipped by the current
+    Omarchy installation; it intentionally does not copy system documentation.
+    A peer runs this same local sync after it discovers the mesh, so no host
+    writes into another host's Hermes home through the network API.
+    """
+    if not all(path.is_file() for path in OMARCHY_DOCS_PATHS):
+        return {"ok": False, "documentationAvailable": False, "installed": [],
+                "updated": [], "error": "Omarchy documentation not found"}
+    try:
+        source = OMARCHY_DOCS_SKILL_SOURCE.read_bytes()
+    except OSError:
+        return {"ok": False, "documentationAvailable": True, "installed": [],
+                "updated": [], "error": "Omarchy docs skill bundle not found"}
+
+    if profiles is None:
+        profiles = ["default"]
+        profile_root = HERMES_HOME / "profiles"
+        if profile_root.is_dir():
+            profiles.extend(path.name for path in profile_root.iterdir() if path.is_dir())
+    valid_names = {str(name) for name in profiles if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", str(name))}
+    names = (["default"] if "default" in valid_names else []) + sorted(valid_names - {"default"})
+    installed, updated, unchanged, failed = [], [], [], []
+    for profile in names:
+        target = HERMES_HOME / "profiles" / profile / "skills" / "omarchy" / "omarchy-docs" / "SKILL.md"
+        existed = target.is_file()
+        try:
+            if existed and target.read_bytes() == source:
+                unchanged.append(profile)
+                continue
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".omarchy-docs.", dir=target.parent)
+            try:
+                os.fchmod(fd, 0o644)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(source)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, target)
+                os.chmod(target, 0o644)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            (updated if existed else installed).append(profile)
+        except OSError:
+            failed.append(profile)
+    return {"ok": not failed,
+            "documentationAvailable": True, "installed": installed,
+            "updated": updated, "unchanged": unchanged, "profiles": names,
+            "failed": failed,
+            "error": "" if not failed else "Could not install Omarchy docs skill"}
+
+
+def sync_peers():
+    """Discover legacy gateways without silently enrolling them or exposing keys."""
+    docs_sync = sync_omarchy_docs_skills()
+    scan = discover_peers()
+    result = list_peers()
+    current_urls = {p.get("url", "").rstrip("/") for p in result.get("peers", [])}
+    unregistered = [p for p in scan.get("discovered", [])
+                    if p.get("url", "").rstrip("/") not in current_urls]
+    result.update({"discovered": unregistered, "added": [],
+                   "rejected": [], "localIp": scan.get("localIp", ""),
+                   "omarchyDocs": docs_sync})
+    return result
+
+
+def dashboard_status():
+    """Query the local Hermes dashboard /api/status."""
+    try:
+        resp = urllib.request.urlopen("http://localhost:9119/api/status", timeout=3)
+        return json.loads(resp.read().decode())
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _window_label(seconds):
+    seconds = int(seconds or 0)
+    if seconds == 604800:
+        return "Semanal"
+    if seconds and seconds % 3600 == 0:
+        return f"{seconds // 3600} h"
+    if seconds and seconds % 60 == 0:
+        return f"{seconds // 60} min"
+    return "Cuota"
+
+
+def _quota_window(raw, label=None):
+    if not isinstance(raw, dict) or raw.get("used_percent") is None:
+        return None
+    duration = int(raw.get("limit_window_seconds") or 0)
+    used = max(0.0, min(100.0, float(raw.get("used_percent") or 0)))
+    return {
+        "label": label or _window_label(duration),
+        "usedPercent": used,
+        "availablePercent": 100.0 - used,
+        "resetAt": float(raw.get("reset_at") or 0),
+        "windowSeconds": duration,
+    }
+
+
+def _parse_openai_quota(payload):
+    windows = []
+    rate = payload.get("rate_limit") or {}
+    for name in ("primary_window", "secondary_window"):
+        item = _quota_window(rate.get(name))
+        if item:
+            windows.append(item)
+    for extra in payload.get("additional_rate_limits") or []:
+        title = str(extra.get("limit_name") or "Modelo")
+        rate = extra.get("rate_limit") or {}
+        for name in ("primary_window", "secondary_window"):
+            raw = rate.get(name) or {}
+            item = _quota_window(raw, f"{title} · {_window_label(raw.get('limit_window_seconds'))}")
+            if item:
+                windows.append(item)
+    return windows
+
+
+def _iso_epoch(value):
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_kimi_quota(payload):
+    windows = []
+    weekly = payload.get("usage") or {}
+    if weekly.get("used") is not None:
+        windows.append({
+            "label": "Semanal",
+            "usedPercent": max(0.0, min(100.0, float(weekly.get("used") or 0))),
+            "availablePercent": 100.0 - max(0.0, min(100.0, float(weekly.get("used") or 0))),
+            "resetAt": _iso_epoch(weekly.get("resetTime")),
+            "windowSeconds": 604800,
+        })
+    for row in payload.get("limits") or []:
+        window = row.get("window") or {}
+        duration = int(window.get("duration") or 0)
+        unit = str(window.get("timeUnit") or "")
+        seconds = duration * (60 if unit.endswith("MINUTE") else 3600 if unit.endswith("HOUR") else 1)
+        detail = row.get("detail") or {}
+        if detail.get("used") is None:
+            continue
+        windows.append({
+            "label": _window_label(seconds),
+            "usedPercent": max(0.0, min(100.0, float(detail.get("used") or 0))),
+            "availablePercent": 100.0 - max(0.0, min(100.0, float(detail.get("used") or 0))),
+            "resetAt": _iso_epoch(detail.get("resetTime")),
+            "windowSeconds": seconds,
+        })
+    return windows
+
+
+def _usage_db_paths():
+    hermes_home = Path.home() / ".hermes"
+    paths = [hermes_home / "state.db"]
+    paths.extend(sorted((hermes_home / "profiles").glob("*/state.db")))
+    return [path for path in paths if path.exists()]
+
+
+def _local_provider_usage(db_paths=None, now=None):
+    now = time.time() if now is None else float(now)
+    totals = {}
+    for path in db_paths or _usage_db_paths():
+        try:
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            rows = db.execute("""
+                SELECT billing_provider,
+                       COALESCE(last_activity_at, ended_at, started_at),
+                       COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+COALESCE(reasoning_tokens,0),
+                       COALESCE(api_call_count,0)
+                FROM sessions WHERE COALESCE(billing_provider,'') <> ''
+            """).fetchall()
+            db.close()
+        except (sqlite3.Error, OSError):
+            continue
+        for provider, active_at, tokens, calls in rows:
+            item = totals.setdefault(provider, {
+                "provider": provider, "hourTokens": 0, "weekTokens": 0,
+                "hourCalls": 0, "weekCalls": 0,
+            })
+            age = now - float(active_at or 0)
+            if 0 <= age <= 604800:
+                item["weekTokens"] += int(tokens or 0)
+                item["weekCalls"] += int(calls or 0)
+            if 0 <= age <= 3600:
+                item["hourTokens"] += int(tokens or 0)
+                item["hourCalls"] += int(calls or 0)
+    return sorted(totals.values(), key=lambda item: (-item["weekTokens"], item["provider"]))
+
+
+def _read_env_value(name):
+    try:
+        for line in (Path.home() / ".hermes" / ".env").read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == name:
+                return value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def _get_json(url, headers):
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=12) as response:
+        raw = response.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("provider usage response exceeds 1 MiB")
+    return json.loads(raw.decode("utf-8"))
+
+
+def _codex_access_token(auth, codex_auth_path=None):
+    """Resolve the Codex OAuth access token from the Hermes auth store.
+
+    Current Hermes keeps provider credentials in ``credential_pool.<provider>``
+    entries; older stores keep them under ``providers.<provider>.tokens``. Pool
+    wins over legacy. As a last resort, recover the Codex CLI auth file
+    (``~/.codex/auth.json``), mirroring Hermes' own read-only recovery path.
+    Returns None when no usable credential exists.
+    """
+    pool = (auth.get("credential_pool") or {}).get("openai-codex") or []
+    for entry in pool:
+        if isinstance(entry, dict) and entry.get("access_token"):
+            return entry["access_token"]
+    legacy = ((auth.get("providers") or {}).get("openai-codex") or {}).get("tokens") or {}
+    if legacy.get("access_token"):
+        return legacy["access_token"]
+    cli_path = codex_auth_path if codex_auth_path is not None else Path.home() / ".codex" / "auth.json"
+    try:
+        cli = json.loads(Path(cli_path).read_text(encoding="utf-8"))
+        if cli.get("access_token"):
+            return cli["access_token"]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _openai_quota():
+    try:
+        auth = json.loads((Path.home() / ".hermes" / "auth.json").read_text(encoding="utf-8"))
+        token = _codex_access_token(auth)
+        if not token:
+            return {"windows": [], "status": "unauthenticated"}
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+                   "User-Agent": "omarchy-hermes/1"}
+        try:
+            part = token.split(".")[1]
+            part += "=" * (-len(part) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(part))
+            account_id = (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+            if account_id:
+                headers["ChatGPT-Account-Id"] = account_id
+        except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        payload = _get_json("https://chatgpt.com/backend-api/wham/usage", headers)
+        return {"windows": _parse_openai_quota(payload), "status": "ok"}
+    except (OSError, KeyError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+        return {"windows": [], "status": "unavailable"}
+
+
+def _kimi_quota():
+    key = _read_env_value("KIMI_CODING_API_KEY")
+    if not key:
+        return {"windows": [], "status": "unavailable"}
+    try:
+        payload = _get_json("https://api.kimi.com/coding/v1/usages", {
+            "Authorization": f"Bearer {key}", "Accept": "application/json",
+            "User-Agent": "omarchy-hermes/1",
+        })
+        return {"windows": _parse_kimi_quota(payload), "status": "ok"}
+    except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+        return {"windows": [], "status": "unavailable"}
+
+
+def _parse_nous_account(payload):
+    if not payload.get("loggedIn"):
+        return {"windows": [], "details": [], "status": "unauthenticated"}
+    windows = []
+    details = []
+    cap = payload.get("monthlyCredits")
+    remaining = payload.get("creditsRemaining")
+    if isinstance(cap, (int, float)) and cap > 0 and isinstance(remaining, (int, float)) and remaining <= cap:
+        windows.append({
+            "label": "Mensual",
+            "usedPercent": max(0.0, min(100.0, (cap - remaining) / cap * 100.0)),
+            "resetAt": _iso_epoch(payload.get("periodEnd")),
+            "windowSeconds": 0,
+        })
+    total = payload.get("totalUsable")
+    if isinstance(total, (int, float)):
+        details.append("US$%.2f disponible" % total)
+    if payload.get("paidAccess") is False:
+        details.append("Acceso de pago agotado")
+    return {"windows": windows, "details": details,
+            "plan": str(payload.get("plan") or ""),
+            "status": "ok" if windows or details else "unsupported"}
+
+
+def _nous_quota():
+    hermes_root = Path.home() / ".hermes" / "hermes-agent"
+    python = hermes_root / "venv" / "bin" / "python"
+    if not python.exists():
+        return {"windows": [], "details": [], "status": "unsupported"}
+    code = """
+import json,sys
+sys.path.insert(0, %r)
+from hermes_cli.nous_account import get_nous_portal_account_info
+x=get_nous_portal_account_info(force_fresh=True)
+s=x.subscription; a=x.paid_service_access_info
+print(json.dumps({'loggedIn':x.logged_in,'plan':getattr(s,'plan',None),
+'monthlyCredits':getattr(s,'monthly_credits',None),'creditsRemaining':getattr(s,'credits_remaining',None),
+'totalUsable':getattr(a,'total_usable_credits',None),'paidAccess':x.paid_service_access,
+'periodEnd':getattr(s,'current_period_end',None)}))
+""" % str(hermes_root)
+    try:
+        result = subprocess.run([str(python), "-c", code], capture_output=True,
+                                text=True, timeout=15, cwd=str(hermes_root))
+        if result.returncode != 0:
+            return {"windows": [], "details": [], "status": "unavailable"}
+        return _parse_nous_account(json.loads(result.stdout))
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return {"windows": [], "details": [], "status": "unavailable"}
+
+
+def provider_usage():
+    local = {item["provider"]: item for item in _local_provider_usage()}
+    providers = set(local) | {"openai-codex", "kimi-coding"}
+    result = []
+    for provider in sorted(providers):
+        item = local.get(provider, {
+            "provider": provider, "hourTokens": 0, "weekTokens": 0,
+            "hourCalls": 0, "weekCalls": 0,
+        })
+        quota = (_openai_quota() if provider == "openai-codex" else
+                 _kimi_quota() if provider == "kimi-coding" else
+                 _nous_quota() if provider == "nous" else
+                 {"windows": [], "status": "unsupported"})
+        result.append({**item, "quota": quota})
+    return {"providers": result, "updatedAt": time.time()}
+
+
+def send_peer_dm(peer, text):
+    try:
+        result = subprocess.run(
+            ["hermes", "peer", "dm", str(peer), str(text)],
+            capture_output=True, text=True, timeout=120,
+        )
+        return {"ok": result.returncode == 0,
+                "error": redact((result.stderr or result.stdout or "")[-300:])}
+    except Exception as exc:
+        return {"ok": False, "error": redact(str(exc))[:300]}
+
+
+def _bot_mode_protocol_enabled():
+    cfg = os.path.expanduser("~/.hermes/config.yaml")
+    try:
+        with open(cfg) as f:
+            txt = f.read()
+        m = re.search(r"bot_mode_protocol:\s*(\w+)", txt)
+        if m:
+            return m.group(1).lower() not in ("false", "off", "no", "0")
+    except Exception:
+        pass
+    return True
+
+
+def _read_model_config(path):
+    """Read only the model section needed by the bot editor."""
+    result = {"model": "", "provider": ""}
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return result
+    in_model = False
+    for line in lines:
+        if line == "model:":
+            in_model = True
+            continue
+        if in_model and line and not line[0].isspace():
+            break
+        if not in_model:
+            continue
+        match = re.match(r"\s+(default|provider):\s*([^#]+?)\s*$", line)
+        if not match:
+            continue
+        key = "model" if match.group(1) == "default" else "provider"
+        result[key] = match.group(2).strip().strip("'\"")
+    return result
+
+
+def list_bots(quick=False):
+    """Bot Mode roster: profiles + their canonical Bot Chat sessions.
+
+    A Bot is a Hermes profile (``~/.hermes/profiles/<name>``). Its canonical
+    Bot Chat is the api_server session bound to that profile (``default``'s
+    has profile_name NULL).
+
+    ``quick=True`` skips the per-profile ``hermes profile describe``
+    subprocesses (one Python boot each) and reads a disk cache instead —
+    used by the panel's live 1.5s poll. The full mode refreshes the cache.
+    """
+    DESC_CACHE = os.path.expanduser("~/.cache/omarchy-hermes-bot-descs.json")
+    profiles = []
+    try:
+        result = subprocess.run(
+            ["hermes", "profile", "list"],
+            capture_output=True, text=True, timeout=15
+        )
+        for line in result.stdout.splitlines():
+            line = line.rstrip()
+            if not line.strip() or "Profile" in line and "Model" in line:
+                continue
+            if line.strip().startswith("─") or line.strip().startswith("-"):
+                continue
+            m = re.match(r"\s*(?:◆)?(\S+)\s{2,}(\S+)\s{2,}(\S+)", line)
+            if m:
+                profiles.append({
+                    "name": m.group(1),
+                    "model": m.group(2),
+                    "gateway": m.group(3),
+                })
+    except Exception:
+        pass
+
+    # Descriptions (role text used by the bot-to-bot roster).
+    desc_cache = {}
+    if quick:
+        try:
+            with open(DESC_CACHE) as f:
+                desc_cache = json.load(f)
+        except Exception:
+            desc_cache = {}
+    else:
+        try:
+            os.makedirs(os.path.dirname(DESC_CACHE), exist_ok=True)
+        except Exception:
+            pass
+    fresh_descs = {}
+    for p in profiles:
+        if quick:
+            p["description"] = desc_cache.get(p["name"], "")
+            continue
+        try:
+            r = subprocess.run(
+                ["hermes", "profile", "describe", p["name"]],
+                capture_output=True, text=True, timeout=10
+            )
+            txt = r.stdout.strip()
+            p["description"] = "" if "no description" in txt.lower() else txt
+        except Exception:
+            p["description"] = ""
+        fresh_descs[p["name"]] = p["description"]
+    if not quick and fresh_descs:
+        try:
+            with open(DESC_CACHE, "w") as f:
+                json.dump(fresh_descs, f)
+        except Exception:
+            pass
+
+    # Canonical Bot Chat sessions per profile (each profile owns its state.db).
+    bot_chats = {}
+    for profile_row in profiles:
+        profile_name = profile_row["name"]
+        db_path = _profile_state_db(profile_name)
+        if not os.path.isfile(db_path):
+            continue
+        try:
+            conn = open_db(profile_name)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """SELECT id, title, message_count, last_activity_at,
+                          last_activity_description, ended_at
+                   FROM sessions WHERE title='Bot Chat'
+                   ORDER BY last_activity_at DESC LIMIT 1"""
+            ).fetchone()
+            if row:
+                bot_chats[profile_name] = {
+                    "sessionId": row["id"],
+                    "title": row["title"] or "Bot Chat",
+                    "messageCount": row["message_count"],
+                    "lastActivityAt": row["last_activity_at"],
+                    "lastActivityDescription": row["last_activity_description"],
+                    "endedAt": row["ended_at"],
+                }
+            conn.close()
+        except Exception:
+            pass
+
+    now = time.time()
+    for p in profiles:
+        configured_model = _read_model_config(_profile_config_path(p["name"]))
+        if configured_model["model"]:
+            p["model"] = configured_model["model"]
+        p["provider"] = configured_model["provider"]
+        p["botChat"] = bot_chats.get(p["name"])
+        p["managed"] = _is_managed(_profile_yaml_path(p["name"]))
+        meta = _read_bot_meta(p["name"])
+        p["title"] = meta["title"] or ("Hermes" if p["name"] == "default" else p["name"])
+        if not p.get("description"):
+            p["description"] = meta["description"]
+        p["hidden"] = meta["hidden"]
+        p["groups"] = [g.get("id") for g in meta["groups"]]
+        p["avatarHue"] = _avatar_hue(p["name"])
+        p["avatarShape"] = meta["avatarShape"] or "oval"
+        p["avatarColor"] = meta["avatarColor"] or ""
+        la = (p["botChat"] or {}).get("lastActivityAt") or 0
+        p["activeNow"] = (now - float(la)) < 90 if la else False
+        if p["botChat"]:
+            wk, act = _session_working_state({
+                "last_activity_at": p["botChat"].get("lastActivityAt"),
+                "last_activity_description": p["botChat"].get("lastActivityDescription"),
+                "ended_at": p["botChat"].get("endedAt"),
+            })
+            p["working"] = wk
+            p["activity"] = act
+        else:
+            p["working"] = False
+            p["activity"] = ""
+        p["lastActivity"] = time.strftime("%d %b %H:%M", time.localtime(float(la))) if la else ""
+
+    groups = list_groups()["groups"]
+
+    gateway_running = False
+    try:
+        r = subprocess.run(["pgrep", "-f", "hermes.*gateway"], capture_output=True, timeout=5)
+        gateway_running = r.returncode == 0
+    except Exception:
+        pass
+
+    return {
+        "bots": profiles,
+        "groups": groups,
+        "botModeProtocol": _bot_mode_protocol_enabled(),
+        "botModeManaged": any(p.get("managed") for p in profiles),
+        "gatewayRunning": gateway_running,
+        "botChatCount": len(bot_chats),
+    }
+
+
+def _profile_yaml_path(profile_name):
+    if profile_name == "default":
+        d = os.path.expanduser("~/.hermes")
+        p = os.path.join(d, "profile.yaml")
+        return p if os.path.isfile(p) else os.path.join(d, "profiles/default/profile.yaml")
+    return os.path.expanduser("~/.hermes/profiles/%s/profile.yaml" % profile_name)
+
+
+def _profile_config_path(profile_name):
+    if profile_name == "default":
+        return os.path.expanduser("~/.hermes/config.yaml")
+    return os.path.expanduser("~/.hermes/profiles/%s/config.yaml" % profile_name)
+
+
+def _read_bot_meta(profile_name):
+    """Parse profile.yaml: ui_meta.hermes-bots block + top-level description."""
+    meta = {"title": "", "description": "", "groups": [], "hidden": False,
+            "avatarShape": "", "avatarColor": ""}
+    try:
+        import yaml
+        with open(_profile_yaml_path(profile_name)) as f:
+            data = yaml.safe_load(f) or {}
+        meta["description"] = data.get("description") or ""
+        ui = data.get("ui_meta") or {}
+        hb = ui.get("hermes-bots") or {}
+        meta["title"] = hb.get("title") or ""
+        meta["hidden"] = hb.get("hidden") is True
+        meta["avatarShape"] = hb.get("avatarShape") or ""
+        meta["avatarColor"] = hb.get("avatarColor") or ""
+        groups = hb.get("groups") or []
+        meta["groups"] = [g for g in groups if isinstance(g, dict) and g.get("id")]
+    except Exception:
+        pass
+    return meta
+
+
+def _avatar_hue(name):
+    """Deterministic hue 0-360 from a bot name, golden-angle spread so
+    similar hashes (default/scout) land in clearly distinct colors."""
+    h = 0
+    for ch in name:
+        h = (h * 31 + ord(ch)) % 360
+    return (h * 137.508) % 360
+
+
+def _stamp_bot_managed(profile_name, title=None):
+    """Mark a profile as Bot-Mode-managed (ui_meta['hermes-bots'] in profile.yaml).
+
+    This is the switch that makes Hermes inject the bot-to-bot protocol and the
+    message_agent tool into canonical Bot Chats (tools/bot_mode_probe.py).
+    Returns True when the file was changed.
+    """
+    path = _profile_yaml_path(profile_name)
+    # The default profile may not have a profile.yaml yet — create it.
+    if not os.path.isfile(path):
+        if profile_name != "default":
+            return False
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "a").close()
+        except Exception:
+            return False
+    try:
+        import yaml
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            data = {}
+        ui = data.get("ui_meta")
+        if not isinstance(ui, dict):
+            ui = {}
+        hb = ui.get("hermes-bots")
+        if isinstance(hb, dict) and hb.get("title"):
+            return False  # already managed
+        hb = dict(hb) if isinstance(hb, dict) else {}
+        hb.setdefault("title", title or ("Hermes" if profile_name == "default" else profile_name))
+        ui["hermes-bots"] = hb
+        data["ui_meta"] = ui
+        with open(path, "w") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+        return True
+    except Exception:
+        return False
+
+
+def _write_bot_title(profile_name, title):
+    path = _profile_yaml_path(profile_name)
+    if not os.path.isfile(path) or not title:
+        return False
+    try:
+        import yaml
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            data = {}
+        ui = data.get("ui_meta")
+        if not isinstance(ui, dict):
+            ui = {}
+        hb = ui.get("hermes-bots")
+        if not isinstance(hb, dict):
+            hb = {"title": profile_name}
+        hb["title"] = title
+        ui["hermes-bots"] = hb
+        data["ui_meta"] = ui
+        with open(path, "w") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+        return True
+    except Exception:
+        return False
+
+
+def _write_bot_model(profile_name, model, provider=None):
+    path = _profile_config_path(profile_name)
+    if not os.path.isfile(path) or not model:
+        return False
+    try:
+        import yaml
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        m = data.get("model")
+        if not isinstance(m, dict):
+            m = {}
+        m["default"] = model
+        if provider:
+            m["provider"] = provider
+        data["model"] = m
+        with open(path, "w") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+        return True
+    except Exception:
+        return False
+
+
+def update_bot(profile_name, title=None, description=None, model=None, provider=None, hidden=None,
+               avatar_shape=None, avatar_color=None):
+    """Update a Bot's persona: friendly title, role description, model pin, avatar."""
+    result = {"ok": True, "changed": []}
+    try:
+        if title and _write_bot_title(profile_name, title):
+            result["changed"].append("title")
+        if description:
+            r = subprocess.run(
+                ["hermes", "profile", "describe", profile_name, "--text", description],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                result["changed"].append("description")
+        if model and _write_bot_model(profile_name, model, provider):
+            result["changed"].append("model")
+        if hidden is not None or avatar_shape or avatar_color:
+            path = _profile_yaml_path(profile_name)
+            import yaml
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
+            ui = data.get("ui_meta") or {}
+            hb = ui.get("hermes-bots")
+            if not isinstance(hb, dict):
+                hb = {"title": profile_name}
+            if hidden is not None:
+                hb["hidden"] = bool(hidden)
+                result["changed"].append("hidden")
+            if avatar_shape:
+                hb["avatarShape"] = avatar_shape
+                result["changed"].append("avatarShape")
+            if avatar_color:
+                hb["avatarColor"] = avatar_color
+                result["changed"].append("avatarColor")
+            ui["hermes-bots"] = hb
+            data["ui_meta"] = ui
+            with open(path, "w") as f:
+                yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+    except Exception as e:
+        result = {"ok": False, "changed": [], "output": str(e)}
+    return result
+
+
+def _load_yaml(path):
+    try:
+        import yaml
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_yaml(path, data):
+    import yaml
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+
+
+def list_groups():
+    """Group rooms mirrored in member profiles' ui_meta.hermes-bots.groups."""
+    rooms = {}
+    profiles_dir = os.path.expanduser("~/.hermes/profiles")
+    names = []
+    if os.path.isdir(profiles_dir):
+        names = [n for n in sorted(os.listdir(profiles_dir))
+                 if os.path.isdir(os.path.join(profiles_dir, n))]
+    default_yaml = os.path.expanduser("~/.hermes/profile.yaml")
+    if os.path.isfile(default_yaml):
+        names = ["default"] + names
+    for name in names:
+        for g in _read_bot_meta(name)["groups"]:
+            rid = g.get("id")
+            if rid not in rooms:
+                rooms[rid] = {
+                    "id": rid,
+                    "name": g.get("name") or rid,
+                    "members": g.get("members") or [],
+                    "createdAt": g.get("createdAt") or 0,
+                }
+            else:
+                for m in g.get("members") or []:
+                    if m not in rooms[rid]["members"]:
+                        rooms[rid]["members"].append(m)
+    out = list(rooms.values())
+    out.sort(key=lambda r: -(r.get("createdAt") or 0))
+    return {"groups": out}
+
+
+def list_room_chats(migrate_legacy=False):
+    """Read native Desktop snapshots and separate legacy hosted rooms.
+
+    migrate_legacy remains an ignored compatibility argument: LIST never writes.
+    """
+    try:
+        errors = {}
+        try:
+            hosted = room_request("list", limit=50, offset=0).get("rooms") or []
+        except Exception as exc:
+            hosted = []
+            errors["legacy"] = str(exc)[:240]
+        try:
+            native = desktop_rooms()
+        except Exception as exc:
+            native = []
+            errors["desktop"] = str(exc)[:240]
+        rooms = []
+        for room in hosted + native:
+            details = room.get("members") or []
+            names = [str(member.get("member_id") or member.get("profile") or "")
+                     for member in details if isinstance(member, dict)]
+            try:
+                replay = room if room.get("source") == "desktop" else room_log(str(room.get("room_id") or ""), limit=100)
+                messages = replay.get("messages") or []
+            except Exception:
+                messages = []
+            latest = messages[-1] if messages else {}
+            rooms.append({
+                "id": room.get("room_id"),
+                "source": room.get("source") or "legacy",
+                "readOnly": room.get("readOnly", False),
+                "historyPartial": room.get("historyPartial", False),
+                "name": room.get("name") or room.get("room_id"),
+                "members": names,
+                "memberDetails": details,
+                "createdAt": room.get("created_at") or 0,
+                "latestSeq": room.get("latest_seq") or 0,
+                "lastMessage": latest.get("text") or "",
+                "lastAuthor": latest.get("author") or "",
+                "lastActivityAt": latest.get("time") or 0,
+            })
+        rooms.sort(key=lambda item: (item.get("lastActivityAt") or item.get("createdAt") or 0), reverse=True)
+        return {"ok": len(errors) < 2, "rooms": rooms, "groups": rooms, "sourceErrors": errors}
+    except Exception as exc:
+        return {"ok": False, "rooms": [], "groups": [], "error": str(exc)[:240]}
+
+
+def create_group(name, members):
+    """Create a host-transparent room over Hermes' official RoomLink API."""
+    members = [m for m in members if m]
+    if not name or not 2 <= len(members) <= 6:
+        return {"ok": False, "output": "need name and 2–6 members"}
+    rid = new_room_id(name)
+    bot_map = {bot["name"]: bot for bot in list_bots(quick=True).get("bots", [])}
+    env = _read_env_values()
+    peer_map = {}
+    try:
+        for peer in list_peers().get("peers", []):
+            if peer.get("local") or peer.get("authenticated") is not True:
+                continue
+            peer_map[peer["name"]] = {
+                **peer, "key": _peer_key(peer["name"], env),
+                "agents": {row["profile"]: row for row in peer.get("agents", [])
+                           if isinstance(row, dict) and row.get("profile")},
+            }
+        created = create_distributed_room(
+            rid, name, members, local_bots=bot_map, peers=peer_map)
+    except Exception as exc:
+        return {"ok": False, "output": str(exc)[:240]}
+    hosted = created.get("room") or {}
+    room = {
+        "id": rid, "name": hosted.get("name") or name,
+        "members": [str(row.get("member_id") or row.get("profile") or "")
+                    for row in hosted.get("members", []) if isinstance(row, dict)],
+        "memberDetails": hosted.get("members") or [], "createdAt": int(time.time()),
+        "source": "hosted", "readOnly": False,
+    }
+    return {"ok": True, "room": room, "hosted": hosted}
+
+
+def disband_group(group_id):
+    try:
+        room_request("disband", room_id=group_id, cancel_id="omarchy-disband")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:240]}
+    removed = []
+    profiles_dir = os.path.expanduser("~/.hermes/profiles")
+    names = []
+    if os.path.isdir(profiles_dir):
+        names = [n for n in sorted(os.listdir(profiles_dir))
+                 if os.path.isdir(os.path.join(profiles_dir, n))]
+    for name in names:
+        path = os.path.join(profiles_dir, name, "profile.yaml")
+        if not os.path.isfile(path):
+            continue
+        try:
+            data = _load_yaml(path)
+            ui = data.get("ui_meta")
+            hb = (ui or {}).get("hermes-bots")
+            groups = (hb or {}).get("groups")
+            if not isinstance(groups, list):
+                continue
+            kept = [g for g in groups if not (isinstance(g, dict) and g.get("id") == group_id)]
+            if len(kept) == len(groups):
+                continue
+            hb["groups"] = kept
+            ui["hermes-bots"] = hb
+            data["ui_meta"] = ui
+            _save_yaml(path, data)
+            removed.append(name)
+        except Exception:
+            pass
+    return {"ok": True, "removed": removed}
+
+
+def enable_bot_mode():
+    """Stamp every profile (default + named) as Bot-Mode-managed."""
+    stamped = []
+    try:
+        if _stamp_bot_managed("default", "Hermes"):
+            stamped.append("default")
+        profiles_dir = os.path.expanduser("~/.hermes/profiles")
+        if os.path.isdir(profiles_dir):
+            for name in sorted(os.listdir(profiles_dir)):
+                if os.path.isdir(os.path.join(profiles_dir, name)):
+                    if _stamp_bot_managed(name):
+                        stamped.append(name)
+    except Exception:
+        pass
+    return {"ok": True, "stamped": stamped}
+
+
+def _is_managed(path):
+    try:
+        with open(path) as f:
+            raw = f.read()
+        if "hermes-bots" not in raw:
+            return False
+        import yaml
+        data = yaml.safe_load(raw) or {}
+        ui = data.get("ui_meta")
+        return isinstance(ui, dict) and isinstance(ui.get("hermes-bots"), dict)
+    except Exception:
+        return False
+
+
+def create_bot(name, description="", clone=False):
+    cmd = ["hermes", "profile", "create", name, "--no-alias"]
+    if description:
+        cmd += ["--description", description]
+    if clone:
+        cmd.append("--clone")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        ok = r.returncode == 0
+        if ok:
+            _stamp_bot_managed(name)
+            enable_bot_mode()  # ensure the whole roster is managed
+        return {"ok": ok, "output": (r.stdout + r.stderr).strip()[-400:]}
+    except Exception as e:
+        return {"ok": False, "output": str(e)}
+
+
+def _session_working_state(row):
+    """Derive live 'working' status from a sessions table row.
+
+    Hermes writes last_activity_description while a turn runs
+    ('tool running: terminal', 'starting new turn', 'compacting ...') and
+    leaves ended_at NULL while the session is alive.
+    """
+    desc = (row["last_activity_description"] or "").strip() if "last_activity_description" in row.keys() else ""
+    ended = row["ended_at"] if "ended_at" in row.keys() else None
+    la = row["last_activity_at"] or 0
+    age = time.time() - float(la) if la else 9999
+    if ended is not None or age > 180:
+        return False, ""
+    if desc and "completed" not in desc.lower():
+        return True, desc
+    if age < 45:
+        return True, "working"
+    return False, ""
+
+
+def list_models(filter_text="", limit=50):
+    """Search the models.dev disk cache (~/.hermes/models_dev_cache.json).
+
+    Providers with a configured API key (X_API_KEY env → provider slug) sort
+    first. Entries are {id, provider, name} where id is 'provider/model'.
+    """
+    cache = os.path.expanduser("~/.hermes/models_dev_cache.json")
+    providers = {}
+    try:
+        with open(cache) as f:
+            providers = json.load(f)
+    except Exception:
+        return {"models": []}
+
+    connected = set()
+    try:
+        with open(os.path.expanduser("~/.hermes/.env")) as f:
+            for line in f:
+                m = re.match(r"([A-Z0-9]+(?:_[A-Z0-9]+)*)_API_KEY=\s*(.+)", line)
+                if m and m.group(2).strip().strip("\"'"):
+                    connected.add(m.group(1).lower().replace("_", "-"))
+    except Exception:
+        pass
+    # OAuth-backed providers do not have *_API_KEY entries. auth.json is the
+    # canonical credential store; only expose provider names, never values.
+    try:
+        with open(os.path.expanduser("~/.hermes/auth.json")) as f:
+            auth = json.load(f)
+        suppressed = set(auth.get("suppressed_sources") or []) if isinstance(auth, dict) else set()
+        oauth = auth.get("providers") if isinstance(auth, dict) else {}
+        pool = auth.get("credential_pool") if isinstance(auth, dict) else {}
+        if isinstance(oauth, dict):
+            connected.update(str(p) for p in oauth if p not in suppressed)
+        if isinstance(pool, dict):
+            connected.update(str(p) for p in pool if p not in suppressed)
+    except Exception:
+        pass
+
+    q = filter_text.lower().strip()
+
+    out = []
+    for p in providers.keys():
+        # Opening the picker should be useful, not dump models from 200+
+        # unavailable providers. Typing a query expands search to the catalog.
+        if not q and connected and p not in connected:
+            continue
+        models = (providers.get(p) or {}).get("models") or {}
+        for mid, info in models.items():
+            label = info.get("name", "") if isinstance(info, dict) else ""
+            full = p + "/" + mid
+            if not q or q in full.lower() or q in label.lower():
+                out.append({"id": mid, "provider": p, "label": label or mid,
+                            "keyed": p in connected, "connected": p in connected})
+    # Connected providers always lead search results. Sort globally so one large
+    # provider cannot consume the whole limit before another connected one.
+    out.sort(key=lambda h: (not h["connected"],
+                            q not in h["id"].lower() if q else False,
+                            h["provider"], h["id"]))
+    return {"models": out[:limit], "keyedProviders": sorted(connected),
+            "connectedOnly": not bool(q)}
+
+
+def main():
+    if "--usage" in sys.argv:
+        print(json.dumps(provider_usage()))
+        return
+    if "--peer-dm" in sys.argv:
+        peer = sys.argv[sys.argv.index("--peer-dm") + 1]
+        text = sys.argv[sys.argv.index("--text") + 1] if "--text" in sys.argv else ""
+        print(json.dumps(send_peer_dm(peer, text)))
+        return
+    if "--draft" in sys.argv:
+        scope = sys.argv[sys.argv.index("--draft") + 1]
+        conversation_id = sys.argv[sys.argv.index("--draft") + 2]
+        print(json.dumps({"ok": True, "draft": get_draft(scope, conversation_id)}))
+        return
+    if "--save-draft" in sys.argv:
+        scope = sys.argv[sys.argv.index("--save-draft") + 1]
+        conversation_id = sys.argv[sys.argv.index("--save-draft") + 2]
+        text = sys.argv[sys.argv.index("--text") + 1] if "--text" in sys.argv else ""
+        image = sys.argv[sys.argv.index("--image") + 1] if "--image" in sys.argv else ""
+        print(json.dumps({"ok": True, "draft": save_draft(scope, conversation_id, text, image)}))
+        return
+    if "--delete-draft" in sys.argv:
+        scope = sys.argv[sys.argv.index("--delete-draft") + 1]
+        conversation_id = sys.argv[sys.argv.index("--delete-draft") + 2]
+        delete_draft(scope, conversation_id)
+        print(json.dumps({"ok": True}))
+        return
+    if "--chats" in sys.argv:
+        print(json.dumps(list_chats(), default=str))
+        return
+    if "--prefs" in sys.argv:
+        print(json.dumps(load_preferences()))
+        return
+    elif "--set-pref" in sys.argv:
+        key = sys.argv[sys.argv.index("--set-pref") + 1]
+        value = sys.argv[sys.argv.index("--set-pref") + 2]
+        print(json.dumps(set_preference(key, value)))
+        return
+    elif "--rename-peer-agent" in sys.argv:
+        name = sys.argv[sys.argv.index("--rename-peer-agent") + 1]
+        profile = sys.argv[sys.argv.index("--profile") + 1] if "--profile" in sys.argv else "default"
+        title = sys.argv[sys.argv.index("--title") + 1] if "--title" in sys.argv else ""
+        print(json.dumps(set_peer_agent_title(name, profile, title), ensure_ascii=False))
+        return
+    elif "--rename-peer" in sys.argv:
+        name = sys.argv[sys.argv.index("--rename-peer") + 1]
+        title = sys.argv[sys.argv.index("--title") + 1] if "--title" in sys.argv else ""
+        print(json.dumps(set_peer_title(name, title), ensure_ascii=False))
+        return
+    if "--peers" in sys.argv:
+        print(json.dumps(list_peers()))
+        return
+    if "--sync-omarchy-docs" in sys.argv:
+        print(json.dumps(sync_omarchy_docs_skills()))
+        return
+    if "--sync-peers" in sys.argv:
+        print(json.dumps(sync_peers()))
+        return
+    if "--set-lan-access" in sys.argv:
+        value = sys.argv[sys.argv.index("--set-lan-access") + 1].strip().lower()
+        print(json.dumps(set_lan_access(value in ("1", "true", "on", "yes"))))
+        return
+    if "--discover" in sys.argv:
+        print(json.dumps(discover_peers()))
+        return
+    if "--session" in sys.argv:
+        sid = sys.argv[sys.argv.index("--session") + 1]
+        profile = sys.argv[sys.argv.index("--profile") + 1] if "--profile" in sys.argv else ""
+        try:
+            lim = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else 30
+            off = int(sys.argv[sys.argv.index("--offset") + 1]) if "--offset" in sys.argv else 0
+        except Exception:
+            lim, off = 30, 0
+        detail = (remote_session_chat(sid, limit=lim, offset=off)
+                  if _parse_remote_ref(sid)
+                  else list_chats(session_id=sid, limit=lim, offset=off, profile=profile))
+        print(json.dumps(detail, default=str))
+        return
+    if "--ensure-bot-chat" in sys.argv:
+        profile = sys.argv[sys.argv.index("--ensure-bot-chat") + 1]
+        print(json.dumps(ensure_local_bot_chat(profile)))
+        return
+    if "--create-chat" in sys.argv:
+        profile = sys.argv[sys.argv.index("--create-chat") + 1]
+        print(json.dumps(create_local_chat(profile)))
+        return
+    if "--mark-read" in sys.argv:
+        sid = sys.argv[sys.argv.index("--mark-read") + 1]
+        if _parse_remote_ref(sid):
+            print(json.dumps({"ok": True, "remote": True}))
+            return
+        profile = sys.argv[sys.argv.index("--profile") + 1] if "--profile" in sys.argv else ""
+        ok = False
+        try:
+            conn = sqlite3.connect(_profile_state_db(profile), timeout=2)
+            conn.execute("UPDATE sessions SET last_read_at=? WHERE id=?",
+                         (time.time(), sid))
+            conn.commit()
+            conn.close()
+            ok = True
+        except Exception:
+            pass
+        print(json.dumps({"ok": ok}))
+        return
+    if "--create-bot" in sys.argv:
+        name = sys.argv[sys.argv.index("--create-bot") + 1]
+        desc = ""
+        if "--description" in sys.argv:
+            desc = sys.argv[sys.argv.index("--description") + 1]
+        print(json.dumps(create_bot(name, desc, clone="--clone" in sys.argv)))
+        return
+    if "--rename-session" in sys.argv:
+        sid = sys.argv[sys.argv.index("--rename-session") + 1]
+        profile = sys.argv[sys.argv.index("--profile") + 1] if "--profile" in sys.argv else "default"
+        title = sys.argv[sys.argv.index("--title") + 1] if "--title" in sys.argv else ""
+        print(json.dumps(mutate_session(sid, profile=profile, title=title), ensure_ascii=False))
+        return
+    if "--archive-session" in sys.argv:
+        sid = sys.argv[sys.argv.index("--archive-session") + 1]
+        profile = sys.argv[sys.argv.index("--profile") + 1] if "--profile" in sys.argv else "default"
+        result = mutate_session(sid, profile=profile, archived=True)
+        if result.get("ok") is True and not _parse_remote_ref(sid):
+            record_archive_watch(sid, profile)
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    if "--unarchive-arrived-chats" in sys.argv:
+        print(json.dumps(unarchive_chats_with_new_messages(), ensure_ascii=False))
+        return
+    if "--update-bot" in sys.argv:
+        name = sys.argv[sys.argv.index("--update-bot") + 1]
+        def _arg(flag):
+            return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else None
+        hidden = None
+        if "--hidden" in sys.argv:
+            hidden = sys.argv[sys.argv.index("--hidden") + 1].lower() in ("1", "true", "yes")
+        print(json.dumps(update_bot(
+            name,
+            title=_arg("--title"),
+            description=_arg("--description"),
+            model=_arg("--model"),
+            provider=_arg("--provider"),
+            hidden=hidden,
+            avatar_shape=_arg("--avatar-shape"),
+            avatar_color=_arg("--avatar-color"),
+        )))
+        return
+    if "--paste-image" in sys.argv:
+        try:
+            print(json.dumps({"ok": True, "path": save_clipboard_image()}))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)[:240]}))
+        return
+    if "--remove-room-member" in sys.argv:
+        try:
+            room_id = sys.argv[sys.argv.index("--remove-room-member") + 1]
+            member = sys.argv[sys.argv.index("--member") + 1]
+            expected_revision = int(sys.argv[sys.argv.index("--expected-revision") + 1])
+            idempotency_key = sys.argv[sys.argv.index("--idempotency-key") + 1]
+            result = remove_room_member(room_id, member, expected_revision=expected_revision,
+                                        idempotency_key=idempotency_key)
+            print(json.dumps(result, ensure_ascii=False))
+            if result.get("ok") is not True:
+                raise SystemExit(1)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            print(json.dumps({"ok": False, "status": "error", "error": str(exc)[:240]}, ensure_ascii=False))
+            raise SystemExit(1)
+        return
+    if "--add-room-member" in sys.argv:
+        try:
+            room_id = sys.argv[sys.argv.index("--add-room-member") + 1]
+            profile = sys.argv[sys.argv.index("--profile") + 1]
+            bots = {bot["name"]: bot for bot in list_bots(quick=True).get("bots", [])}
+            descriptors = member_descriptors([profile], bots)
+            if not descriptors:
+                raise ValueError("invalid member profile")
+            result = add_room_member(room_id, descriptors[0])
+            print(json.dumps({"ok": True, **result}, ensure_ascii=False))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)[:240]}, ensure_ascii=False))
+            raise SystemExit(1)
+        return
+    if "--groups" in sys.argv:
+        print(json.dumps(list_room_chats()))
+        return
+    if "--room-capabilities" in sys.argv:
+        try:
+            print(json.dumps({"ok": True, "capabilities": room_request("capabilities")}, ensure_ascii=False))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)[:240]}, ensure_ascii=False))
+        return
+    if "--room" in sys.argv:
+        room_id = sys.argv[sys.argv.index("--room") + 1]
+        try:
+            limit = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else 200
+            state = room_request("state", room_id=room_id, **({"limit": limit} if room_id.startswith("desktop::") else {}))
+            replay = state if state.get("source") == "desktop" else room_log(room_id, limit=limit)
+            print(json.dumps({"ok": True, "room": state.get("room") or {},
+                              "source": state.get("source") or "legacy",
+                              "readOnly": state.get("readOnly", False),
+                              "historyPartial": state.get("historyPartial", False),
+                              "driverStatus": state.get("driver_status") or {},
+                              "events": replay.get("events") or [],
+                              "messages": replay.get("messages") or []}))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)[:240], "messages": []}))
+        return
+    if "--native-room-status" in sys.argv:
+        room_id = sys.argv[sys.argv.index("--native-room-status") + 1]
+        try:
+            print(json.dumps({"ok": True, "result": native_status(room_id)}))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)[:240]}))
+        return
+    if "--dispatch-native-room" in sys.argv:
+        room_id = sys.argv[sys.argv.index("--dispatch-native-room") + 1]
+        thread = sys.argv[sys.argv.index("--thread") + 1] if "--thread" in sys.argv else ""
+        try:
+            print(json.dumps({"ok": True, "result": dispatch_native_room(room_id, thread)}))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)[:240]}))
+        return
+    if "--send-room" in sys.argv:
+        room_id = sys.argv[sys.argv.index("--send-room") + 1]
+        text = sys.argv[sys.argv.index("--text") + 1] if "--text" in sys.argv else ""
+        image = sys.argv[sys.argv.index("--image") + 1] if "--image" in sys.argv else None
+        try:
+            print(json.dumps({"ok": True, "result": send_room_message(room_id, text, image)}))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)[:240]}))
+        return
+    if "--rename-room" in sys.argv:
+        room_id = sys.argv[sys.argv.index("--rename-room") + 1]
+        name = sys.argv[sys.argv.index("--name") + 1] if "--name" in sys.argv else ""
+        try:
+            print(json.dumps({"ok": True, "result": rename_room(room_id, name)}))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)[:240]}))
+        return
+    if "--create-group" in sys.argv:
+        name = sys.argv[sys.argv.index("--create-group") + 1]
+        members = []
+        if "--members" in sys.argv:
+            members = [m.strip() for m in sys.argv[sys.argv.index("--members") + 1].split(",") if m.strip()]
+        print(json.dumps(create_group(name, members)))
+        return
+    if "--disband-group" in sys.argv:
+        gid = sys.argv[sys.argv.index("--disband-group") + 1]
+        print(json.dumps(disband_group(gid)))
+        return
+    if "--enable-botmode" in sys.argv:
+        print(json.dumps(enable_bot_mode()))
+        return
+    if "--bots" in sys.argv:
+        print(json.dumps(list_bots(quick="--quick" in sys.argv), default=str))
+        return
+    if "--botstatus" in sys.argv:
+        gw = False
+        try:
+            r = subprocess.run(["pgrep", "-f", "hermes.*gateway"], capture_output=True, timeout=5)
+            gw = r.returncode == 0
+        except Exception:
+            pass
+        print(json.dumps({
+            "gatewayRunning": gw,
+            "botModeProtocol": _bot_mode_protocol_enabled(),
+        }))
+        return
+    if "--models" in sys.argv:
+        filt = sys.argv[sys.argv.index("--models") + 1] if len(sys.argv) > sys.argv.index("--models") + 1 else ""
+        print(json.dumps(list_models(filt)))
+        return
+    if "--status" in sys.argv:
+        print(json.dumps(dashboard_status()))
+        return
+    if "--send" in sys.argv:
+        sid = sys.argv[sys.argv.index("--send") + 1]
+        profile = sys.argv[sys.argv.index("--profile") + 1] if "--profile" in sys.argv else ""
+        text = sys.argv[sys.argv.index("--text") + 1] if "--text" in sys.argv else ""
+        image = sys.argv[sys.argv.index("--image") + 1] if "--image" in sys.argv else None
+        if _parse_remote_ref(sid):
+            print(json.dumps(send_remote_session(sid, text, image)))
+            return
+        cmd = [HERMES_BIN, HERMES_MAIN]
+        if profile and profile != "default":
+            cmd += ["-p", profile]
+        cmd += ["chat", "-q", text, "--resume", sid, "--oneshot", "--quiet"]
+        if image:
+            cmd += ["--image", image]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            print(json.dumps({"ok": r.returncode == 0,
+                              "stderr": (r.stderr or "")[-300:],
+                              "image": bool(image)}))
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)[:200]}))
+        return
+    if "--focus" in sys.argv:
+        pid = sys.argv[sys.argv.index("--focus") + 1]
+        out = {"ok": False}
+        try:
+            r = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=8)
+            for c in json.loads(r.stdout or "[]"):
+                if str(c.get("pid")) == str(pid):
+                    addr = c.get("address", "")
+                    subprocess.run(["hyprctl", "dispatch", "focuswindow",
+                                    "address:%s" % addr], capture_output=True, timeout=8)
+                    out = {"ok": True, "address": addr, "title": c.get("title", "")[:60]}
+                    break
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        print(json.dumps(out))
+        return
+
+    sessions = list_sessions()
+    running = running_hermes_procs()
+
+    active = []
+    for s in sessions:
+        pid = running.get(s["id"])
+        if pid is not None:
+            s["pid"] = pid
+            active.append(s)
+
+    # Remote conversations are first-class Agents entries. Their composite ID
+    # preserves host/profile/session identity, so equal profile or session names
+    # on different gateways can never collapse into one row.
+    remote = list_remote_sessions()
+    combined = active + remote
+    combined.sort(key=lambda row: row.get("lastActivityTs", 0), reverse=True)
+
+    output = {
+        "active": len(active) + sum(1 for row in remote if row.get("working")),
+        "sessions": combined,
+    }
+    print(json.dumps(output))
+
+
+if __name__ == "__main__":
+    main()

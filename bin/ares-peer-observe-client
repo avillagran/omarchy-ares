@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Paint bounded, authenticated peer snapshots. No stdin or writable peer API."""
+import base64
+import binascii
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import struct
+import sys
+import termios
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+MAX_RESPONSE = 16384
+MAX_FRAME = 8192
+ROOM = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        raise ValueError('redirect refused')
+
+def safe_terminal_frame(frame):
+    """Allow terminal painting, not clipboard/title/device control sequences."""
+    result = bytearray()
+    i = 0
+    while i < len(frame):
+        byte = frame[i]
+        if byte != 27:
+            if byte >= 32 or byte in (9, 10, 13):
+                result.append(byte)
+            i += 1
+            continue
+        if i + 1 >= len(frame):
+            break
+        if frame[i + 1] == 91:  # CSI: permit only bounded painting commands.
+            end = i + 2
+            while end < len(frame) and 0x20 <= frame[end] <= 0x3f:
+                end += 1
+            if end == len(frame):
+                break
+            params = frame[i + 2:end]
+            final = frame[end]
+            if (all(c in b'0123456789;:' for c in params)
+                    and final in b'ABCDGHJKfmnsu'):
+                result.extend(frame[i:end + 1])
+            elif params in (b'?1049', b'?25') and final in b'hl':
+                result.extend(frame[i:end + 1])
+            i = end + 1
+            continue
+        if frame[i + 1] in b']P_^X':  # OSC/DCS/APC/PM/SOS: drop the whole string.
+            end = i + 2
+            while end < len(frame):
+                if frame[end] == 7:
+                    end += 1
+                    break
+                if frame[end:end + 2] == b'\x1b\\':
+                    end += 2
+                    break
+                end += 1
+            i = end
+            continue
+        i += 2
+    return bytes(result)
+
+def private_token():
+    state = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state')
+    path = state / 'omarchy/ares/access.token'
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+        raise ValueError('unsafe credential file')
+    token = path.read_text(encoding='utf-8').strip()
+    if not token or any(ch in token for ch in '\r\n'):
+        raise ValueError('invalid credential')
+    return token
+
+def endpoint():
+    base = os.environ.get('ARES_API_URL', 'http://127.0.0.1:9420')
+    url = urllib.parse.urlsplit(base)
+    if (url.scheme != 'http' or url.hostname not in ('127.0.0.1', 'localhost', '::1')
+        or url.username or url.password or url.path not in ('', '/') or url.query or url.fragment):
+        raise ValueError('non-local API')
+    return base.rstrip('/')
+
+def dimensions():
+    try:
+        rows, cols, _, _ = struct.unpack('HHHH', fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b'\0'*8))
+    except (OSError, ValueError):
+        rows, cols = 24, 80
+    return min(100, max(10, rows)), min(200, max(20, cols))
+
+def fetch(base, token, room):
+    rows, cols = dimensions()
+    url = base + '/v1/tty/rooms/' + urllib.parse.quote(room, safe='') + f'/observe?cols={cols}&rows={rows}'
+    request = urllib.request.Request(url, method='GET', headers={'Authorization':'Bearer '+token,'Accept':'application/json'})
+    # urllib follows redirects with Authorization by default. Never forward
+    # the owner credential to another origin or honor proxy environment vars.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(request, timeout=3) as response:
+        raw = response.read(MAX_RESPONSE+1)
+    if len(raw) > MAX_RESPONSE: raise ValueError('oversize response')
+    value = json.loads(raw)
+    if (not isinstance(value, dict) or value.get('ok') is not True
+        or value.get('transport') != 'peer' or value.get('encoding') != 'base64'
+        or not isinstance(value.get('terminalId'), str) or not value['terminalId']
+        or not isinstance(value.get('frame'), str)):
+        raise ValueError('invalid observation')
+    frame = base64.b64decode(value['frame'], validate=True)
+    if len(frame) > MAX_FRAME: raise ValueError('oversize frame')
+    return value['terminalId'], safe_terminal_frame(frame)
+
+def main():
+    if len(sys.argv) != 2 or not ROOM.fullmatch(sys.argv[1]):
+        return 2
+    try:
+        token, base = private_token(), endpoint()
+        owner = None
+        while True:
+            terminal_id, frame = fetch(base, token, sys.argv[1])
+            if owner is not None and terminal_id != owner:
+                raise ValueError('terminal identity changed')
+            owner = terminal_id
+            sys.stdout.buffer.write(b'\x1b[2J\x1b[H' + frame)
+            sys.stdout.buffer.flush()
+            time.sleep(0.5)
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError, binascii.Error, urllib.error.URLError):
+        print('Peer observation unavailable', file=sys.stderr)
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())

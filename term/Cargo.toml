@@ -1,0 +1,12 @@
+[package]
+name = "ares-term"
+version = "0.1.0"
+edition = "2021"
+description = "Per-room Hermes TUI terminal window manager (tmux + qmltermwidget)"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
