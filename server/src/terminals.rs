@@ -370,7 +370,7 @@ fn normalize_with_transport(
         terminals.push(terminal);
     }
     Ok(
-        json!({"host":host,"terminals":terminals,"errors":if matches!(transport, InventoryTransport::Peer) { json!([]) } else { payload["errors"].clone() },"complete":payload["complete"] != false && (matches!(transport, InventoryTransport::Peer) || payload["errors"].as_array().is_some_and(|errors| errors.is_empty()))}),
+        json!({"host":host,"terminals":terminals,"errors":if matches!(transport, InventoryTransport::Peer) { json!([]) } else { payload["errors"].clone() },"stale":if matches!(transport, InventoryTransport::Peer) { json!([]) } else { payload.get("stale").cloned().unwrap_or_else(|| json!([])) },"complete":payload["complete"] != false && (matches!(transport, InventoryTransport::Peer) || payload["errors"].as_array().is_some_and(|errors| errors.is_empty()))}),
     )
 }
 

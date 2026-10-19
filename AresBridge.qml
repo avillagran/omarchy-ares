@@ -294,7 +294,7 @@ Item {
     }
   }
 
-  Timer { id: livePoll; interval: 100; repeat: true; running: bridge.available && bridge.eventRoomId !== ""; onTriggered: bridge.reloadLive() }
+  Timer { id: livePoll; interval: 400; repeat: true; running: bridge.available && bridge.eventRoomId !== ""; onTriggered: bridge.reloadLive() }
   Timer { id: poll; interval: 1200; repeat: true; running: bridge.available; onTriggered: bridge.reload() }
   Timer { id: reconnect; interval: 4000; repeat: false; onTriggered: bridge.start() }
   Component.onCompleted: start()

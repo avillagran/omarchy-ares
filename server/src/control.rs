@@ -24,6 +24,66 @@ impl Store {
         self.dto("rooms", &self.room(text(&room, "id"), false)?)
     }
 
+    /// Singleton orchestrator room: one standing chat (profile `orchestor`) that
+    /// coordinates every other agent. Idempotent; requires the local profile dir
+    /// and a synced `orchestor` bot.
+    pub fn ensure_orchestrator_room(&self) -> Result<Value> {
+        let profile_dir = std::env::var("HOME")
+            .map(|home| format!("{home}/.hermes/profiles/orchestor"))
+            .unwrap_or_default();
+        if !std::path::Path::new(&profile_dir).is_dir() {
+            return Err(
+                "Orchestrator profile is not installed (~/.hermes/profiles/orchestor missing)"
+                    .into(),
+            );
+        }
+        self.one(
+            "SELECT id FROM bots WHERE id='orchestor'",
+            [],
+            "orchestor bot is not synced yet",
+        )?;
+        let project = self.create_project("Orchestrator", &profile_dir, "local", None)?;
+        let project_id = text(&project, "id");
+        let existing = self
+            .rows(
+                "SELECT * FROM rooms WHERE project_id=? AND name='Orchestrator' AND deleted_at IS NULL LIMIT 1",
+                [project_id],
+            )?
+            .first()
+            .cloned();
+        if let Some(room) = existing {
+            let room_id = text(&room, "id");
+            self.heal_orchestrator_room(&room_id)?;
+            return self.dto("rooms", &self.room(&room_id, false)?);
+        }
+        let room = self.create_room(project_id, "Orchestrator", &[json!("orchestor")])?;
+        let room_id = text(&room, "id");
+        // API-created rooms default to source='lonko' (terminal-first view); the
+        // orchestrator is a standing Hermes chat backed by its Desktop session.
+        self.db.execute(
+            "UPDATE rooms SET source='hermes',external_profile='orchestor' WHERE id=?",
+            [&room_id],
+        )?;
+        self.dto("rooms", &self.room(&room_id, false)?)
+    }
+
+    /// Point an API-created (source='lonko') orchestrator room at its Desktop
+    /// session once a binding exists, so the UI shows the chat transcript.
+    fn heal_orchestrator_room(&self, room_id: &str) -> Result<()> {
+        let session: String = self
+            .db
+            .query_row(
+                "SELECT COALESCE((SELECT stored_session_id FROM session_bindings WHERE room_id=? AND stored_session_id!='' LIMIT 1),'')",
+                [room_id],
+                |r| r.get(0),
+            )?;
+        self.db.execute(
+            "UPDATE rooms SET source='hermes',external_profile='orchestor',external_session_id=? WHERE id=? AND source='lonko'",
+            params![session, room_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_control_included(&self, room_id: &str, included: bool) -> Result<Value> {
         let room = self.room(room_id, false)?;
         if matches!(

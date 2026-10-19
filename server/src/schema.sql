@@ -104,5 +104,9 @@
               attachment_ids TEXT NOT NULL DEFAULT '[]', updated_at REAL NOT NULL, PRIMARY KEY(device_id,room_id)
             );
             CREATE INDEX IF NOT EXISTS idx_events_room_cursor ON room_events(room_id,cursor);
+            CREATE INDEX IF NOT EXISTS idx_events_ephemeral ON room_events(room_id) WHERE json_extract(payload,'$.ephemeral')=1;
+            -- hermes_rooms computes MAX(created_at) of transcript-synced events
+            -- per room every sync tick; without this it full-scans every room.
+            CREATE INDEX IF NOT EXISTS idx_events_extmsg ON room_events(room_id,created_at) WHERE json_extract(payload,'$.externalMessageId') IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_executions_room ON executions(room_id,created_at);
             CREATE INDEX IF NOT EXISTS idx_artifacts_room ON artifacts(room_id,created_at);

@@ -233,6 +233,20 @@ def process_started_at(pid):
     return boot + int(fields[19]) / os.sysconf("SC_CLK_TCK")
 
 
+def server_not_running(failure):
+    """The herdr CLI answers a stopped session with a machine-readable code on stderr."""
+    for stream in (failure.stderr, failure.stdout):
+        if not stream or len(stream) > 4096:
+            continue
+        try:
+            body = json.loads(stream)
+        except ValueError:
+            continue
+        if isinstance(body, dict) and body.get("error", {}).get("code") == "server_not_running":
+            return True
+    return False
+
+
 def read_inventory():
     """Observe every existing host session; never create a server, pane or agent."""
     home = Path.home()
@@ -269,16 +283,22 @@ def read_inventory():
             for item in items:
                 item["herdrBin"] = str(executable)
             incomplete = len(items) != len(state.get("panes", []))
-            return items, ({"herdrSession": name, "error": "Some panes could not be identified; inventory is incomplete"} if incomplete else None)
+            return items, ({"herdrSession": name, "error": "Some panes could not be identified; inventory is incomplete"} if incomplete else None), None
+        except subprocess.CalledProcessError as failure:
+            if server_not_running(failure):
+                return [], None, {"herdrSession": name}
+            return [], {"herdrSession": name, "error": "Herdr session could not be inspected"}, None
         except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-            return [], {"herdrSession": name, "error": "Herdr session could not be inspected"}
+            return [], {"herdrSession": name, "error": "Herdr session could not be inspected"}, None
 
-    terminals, errors = [], discovery_errors
+    terminals, errors, stale = [], discovery_errors, []
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for items, error in pool.map(observe, sockets):
+        for items, error, stopped in pool.map(observe, sockets):
             terminals.extend(items)
             if error:
                 errors.append(error)
+            elif stopped:
+                stale.append(stopped)
     roots = [("default", home / ".hermes")]
     roots.extend((p.name, p) for p in sorted((home / ".hermes/profiles").glob("*"))[:32]
                  if p.is_dir() and SESSION_ID.fullmatch(p.name))
@@ -289,7 +309,8 @@ def read_inventory():
         except (OSError, ValueError, KeyError):
             pass
     restrict_guarded_inventory(terminals, home)
-    return {"ok": True, "terminals": terminals, "errors": errors, "complete": not errors}
+    return {"ok": True, "terminals": terminals, "errors": errors, "complete": not errors,
+            "stale": stale}
 
 
 def main():

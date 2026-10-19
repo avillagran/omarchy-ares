@@ -160,10 +160,12 @@ impl Store {
         session: &str,
         keep: &[String],
     ) -> Result<usize> {
-        Ok(self.db.execute("DELETE FROM room_events WHERE room_id IN (SELECT id FROM rooms WHERE source='hermes' AND external_profile=? AND external_session_id=? AND deleted_at IS NULL) AND json_extract(payload,'$.ephemeral')=1 AND id NOT IN (SELECT value FROM json_each(?))",params![profile,session,json!(keep).to_string()])?)
+        // Ephemeral deltas are transient; bound the scan to the recent cursor
+        // window per room so pruning never re-reads a full (possibly huge) room.
+        Ok(self.db.execute("DELETE FROM room_events WHERE room_id IN (SELECT id FROM rooms WHERE source='hermes' AND external_profile=? AND external_session_id=? AND deleted_at IS NULL) AND json_extract(payload,'$.ephemeral')=1 AND id NOT IN (SELECT value FROM json_each(?)) AND cursor>(SELECT COALESCE(MAX(cursor),0)-400 FROM room_events)",params![profile,session,json!(keep).to_string()])?)
     }
     pub fn clear_ephemeral_execution_events(&self, room: &str, id: &str) -> Result<usize> {
-        Ok(self.db.execute("DELETE FROM room_events WHERE room_id=? AND execution_id=? AND json_extract(payload,'$.ephemeral')=1",params![room,id])?)
+        Ok(self.db.execute("DELETE FROM room_events WHERE room_id=? AND execution_id=? AND json_extract(payload,'$.ephemeral')=1 AND cursor>(SELECT COALESCE(MAX(cursor),0)-400 FROM room_events WHERE room_id=?)",params![room,id,room])?)
     }
     pub fn record_pause_outcomes(
         &self,

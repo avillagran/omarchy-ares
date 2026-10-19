@@ -10,10 +10,13 @@ test('native groups are not scalar terminal rooms', () => {
   const body = terminal.match(/readonly property bool terminalRoom: \{([^]*?)\n  \}/)[1];
   for (const source of ['hermes-native-group', 'hermes', 'ares', 'control']) {
     const ctx = vm.createContext({controller: {rooms: [{id: 'r', source}]}, roomId: 'r',
-      nativeGroupRoom: source === 'hermes-native-group'});
+      nativeGroupRoom: source === 'hermes-native-group', orchestratorRoom: false});
     assert.equal(vm.runInContext('(function() {' + body + '})()', ctx),
       !['hermes-native-group', 'control'].includes(source));
   }
+  const orchestrator = vm.createContext({controller: {rooms: [{id: 'r', source: 'hermes'}]},
+    roomId: 'r', nativeGroupRoom: false, orchestratorRoom: true});
+  assert.equal(vm.runInContext('(function() {' + body + '})()', orchestrator), false);
 });
 
 test('group send is rejected before draft mutation, uploads or transport', () => {

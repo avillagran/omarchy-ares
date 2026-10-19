@@ -263,6 +263,10 @@ async fn persisted(client: &reqwest::Client, base: &Url, token: &str, p: &Value)
     if !(1..=500).contains(&limit) || since < 0.0 {
         return Err("invalid transcript request".into());
     }
+    let offset = p["offset"].as_u64().unwrap_or(0);
+    if offset > 100_000 {
+        return Err("invalid transcript request".into());
+    }
     let mut url = base.clone();
     url.path_segments_mut()
         .map_err(|_| "invalid endpoint")?
@@ -276,7 +280,7 @@ async fn persisted(client: &reqwest::Client, base: &Url, token: &str, p: &Value)
         )
         .await?,
     )?;
-    let messages = if detail["last_activity_at"].as_f64().unwrap_or(0.0) <= since {
+    let messages = if offset == 0 && detail["last_activity_at"].as_f64().unwrap_or(0.0) <= since {
         json!([])
     } else {
         url.path_segments_mut()
@@ -284,6 +288,7 @@ async fn persisted(client: &reqwest::Client, base: &Url, token: &str, p: &Value)
             .push("messages");
         url.query_pairs_mut()
             .append_pair("limit", &limit.to_string())
+            .append_pair("offset", &offset.to_string())
             .append_pair("order", "latest")
             .append_pair("include_compacted", "true");
         let v: Value = serde_json::from_slice(

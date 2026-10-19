@@ -60,7 +60,15 @@ Item {
   readonly property bool readOnlyPeer: !!connection.target && connection.target.transport === "peer"
   readonly property bool terminalRoom: {
     var room = controller.rooms.find(function(item) { return item.id === roomId })
-    return !!room && room.source !== "control" && !nativeGroupRoom
+    return !!room && room.source !== "control" && !nativeGroupRoom && !orchestratorRoom
+  }
+  // The orchestrator is a standing Hermes chat (Desktop-backed), never a PTY:
+  // render the GUI transcript + composer instead of the terminal attach gate.
+  readonly property bool orchestratorRoom: {
+    var room = roomRecord
+    if (!room || room.name !== "Orchestrator" || room.source !== "hermes") return false
+    var project = controller.projects.find(function(item) { return item.id === room.projectId })
+    return !!project && project.name === "Orchestrator"
   }
   property bool chooserOpen: false
   property int chooserAttempt: 0

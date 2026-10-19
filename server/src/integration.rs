@@ -25,6 +25,7 @@ struct Stream {
     segment: u64,
     text: String,
     thinking: bool,
+    last_persist: Option<Instant>,
 }
 #[derive(Default)]
 pub struct HermesLiveTranscriptMirror {
@@ -132,12 +133,23 @@ impl HermesLiveTranscriptMirror {
         }
         if !stream.text.is_empty() {
             let complete = ["message.interim", "message.complete"].contains(&kind);
-            remember(
-                &message,
-                "message.assistant",
-                json!({"text":stream.text,"streaming":!complete,"live":!complete,"externalSessionId":key,"sourceOrder":1}),
-                complete,
-            )?;
+            // message.delta arrives per token; persisting every delta rewrites
+            // the whole accumulated row (quadratic I/O). Persist at most every
+            // 200ms per stream once the text is large; interim/complete always flush.
+            let throttled = kind == "message.delta"
+                && stream.text.len() > 4096
+                && stream
+                    .last_persist
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(200));
+            if !throttled {
+                remember(
+                    &message,
+                    "message.assistant",
+                    json!({"text":stream.text,"streaming":!complete,"live":!complete,"externalSessionId":key,"sourceOrder":1}),
+                    complete,
+                )?;
+                stream.last_persist = Some(Instant::now());
+            }
         }
         if kind == "message.interim" {
             stream.segment += 1;
@@ -276,6 +288,7 @@ struct TurnEvents {
     reasoning: String,
     count: u64,
     media: HashSet<PathBuf>,
+    last_persist: Option<Instant>,
 }
 impl TurnEvents {
     fn observe(&mut self, store: &Store, e: &Value, project: &Value, event: &Value) -> Result<()> {
@@ -308,7 +321,13 @@ impl TurnEvents {
         let bot = text(e, "botId");
         if kind == "message.delta" {
             self.text.push_str(first(&p, &["text", "delta"], ""));
-            if !self.text.is_empty() {
+            // Persist at most every 200ms; each write rewrites the whole
+            // accumulated row, so per-token writes are quadratic I/O once the
+            // text grows past a few KB.
+            let throttled = self
+                .last_persist
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(200));
+            if !self.text.is_empty() && !(self.text.len() > 4096 && throttled) {
                 store.event(
                     e,
                     Some(&format!("gw_stream_{id}_message")),
@@ -317,12 +336,16 @@ impl TurnEvents {
                     json!({"text":self.text,"streaming":true}),
                     true,
                 )?;
+                self.last_persist = Some(Instant::now());
             }
             return Ok(());
         }
         if ["reasoning.delta", "thinking.delta"].contains(&kind) {
             self.reasoning.push_str(first(&p, &["text", "delta"], ""));
-            if !self.reasoning.trim().is_empty() {
+            let throttled = self
+                .last_persist
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(200));
+            if !self.reasoning.trim().is_empty() && !(self.reasoning.len() > 4096 && throttled) {
                 store.event(
                     e,
                     Some(&format!("gw_stream_{id}_reasoning")),
@@ -331,6 +354,7 @@ impl TurnEvents {
                     json!({"text":self.reasoning,"streaming":true}),
                     true,
                 )?;
+                self.last_persist = Some(Instant::now());
             }
             return Ok(());
         }

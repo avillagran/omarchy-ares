@@ -467,6 +467,31 @@ Panel {
       refreshLayaTraining()
     })
   }
+  function orchestratorRoom() {
+    for (var i = 0; i < rooms.length; i++) {
+      var room = rooms[i]
+      if (room.name !== "Orchestrator") continue
+      for (var p = 0; p < projects.length; p++) {
+        if (projects[p].id === room.projectId && projects[p].name === "Orchestrator") return room
+      }
+    }
+    return null
+  }
+  function openOrchestrator() {
+    extendedMode = false
+    section = "home"
+    open()
+    if (bridge.available) { ensureOrchestratorRoom(); return }
+    var room = orchestratorRoom()
+    if (room) selectRoom(room)
+  }
+  function ensureOrchestratorRoom() {
+    bridge.request("POST", "/v1/orchestrator/ensure", {}, function(value) {
+      if (!value.ok || !value.room) { errorText = value.error || "Orchestrator is unavailable"; return }
+      bridge.reload()
+      selectRoom(value.room)
+    })
+  }
   function refreshControlItems() {
     bridge.request("GET", "/v1/control", null, function(value) {
       if (!value.ok) { errorText = value.error || "Could not load Control Room"; return }
@@ -1409,6 +1434,7 @@ Panel {
     function preferences() { root.extendedMode = false; root.section = "preferences"; root.open() }
     function archived() { root.extendedMode = false; root.section = "archived"; root.open() }
     function control() { root.openControlRoom() }
+    function orchestrator() { root.openOrchestrator() }
     function peers() { root.openPeers() }
     function controlText() { root.controlMode = "text"; root.openControlRoom() }
     function controlVisual() { root.controlMode = "visual"; root.openControlRoom() }

@@ -8,3 +8,5 @@ QMLTermWidget
 /server/target/
 .venv-laya/
 offline-only/
+/herdr-notify/target/
+/libherdr/target/

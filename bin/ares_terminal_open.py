@@ -92,7 +92,7 @@ def stored_session(request):
                         or not probe.SESSION_ID.fullmatch(parent)
                         or config.get("_delegate_from") != parent):
                     raise RuntimeError("Subagent stored session has no verified delegate parent")
-            elif row["source"] not in ("cli", "telegram"):
+            elif row["source"] not in ("cli", "telegram", "ares"):
                 raise RuntimeError("Stored session source is unsupported for guarded opening")
             if row["source"] == "telegram" and (not isinstance(row["session_key"], str)
                     or not row["session_key"].strip() or row["session_key"] == row["id"]):

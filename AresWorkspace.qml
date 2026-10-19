@@ -358,6 +358,11 @@ Item {
           onActivated: controller.openControlRoom()
         }
         ActionButton {
+          glyph: "♛"
+          hint: "Orchestrator — one chat that manages everything"
+          onActivated: controller.openOrchestrator()
+        }
+        ActionButton {
           glyph: "󰒙"
           hint: "Peer services — discover, pair and review activity"
           onActivated: controller.openPeers()

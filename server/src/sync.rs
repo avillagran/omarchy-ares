@@ -279,20 +279,41 @@ pub async fn sync_recent_hermes_transcripts(
         } else {
             0.0
         };
-        let response = bridge
-            .call(
-                "session.messages",
-                json!({"profile":profile,"session_id":sid,"limit":500,"since":since}),
-                20,
-            )
-            .await;
-        if response["ok"] != true || !response["result"]["messages"].is_array() {
-            continue;
+        // Page backwards from the newest message only until known territory is
+        // reached. A full 500-message window per room per cycle transferred and
+        // re-parsed tens of MB/s on busy sessions for zero new events.
+        const PAGE: u64 = 40;
+        const MAX_PAGES: u64 = 5;
+        let mut offset = 0u64;
+        loop {
+            let response = bridge
+                .call(
+                    "session.messages",
+                    json!({"profile":profile,"session_id":sid,"limit":PAGE,"offset":offset,"since":since}),
+                    20,
+                )
+                .await;
+            if response["ok"] != true || !response["result"]["messages"].is_array() {
+                break;
+            }
+            let result = &response["result"];
+            let messages = array(&result["messages"]);
+            if messages.is_empty() {
+                break;
+            }
+            let count = messages.len() as u64;
+            let oldest = messages
+                .iter()
+                .filter_map(|m| m["timestamp"].as_f64())
+                .fold(f64::INFINITY, f64::min);
+            with_store(store, |s| {
+                s.sync_hermes_transcript(profile, sid, messages, &result["session"])
+            })?;
+            offset += count;
+            if count < PAGE || oldest <= since || offset >= PAGE * MAX_PAGES {
+                break;
+            }
         }
-        let result = &response["result"];
-        with_store(store, |s| {
-            s.sync_hermes_transcript(profile, sid, array(&result["messages"]), &result["session"])
-        })?;
     }
     Ok(())
 }
@@ -459,7 +480,7 @@ impl Runtime {
         let m = mirror.clone();
         tasks.push(tokio::spawn(async move{let mut persisted=tokio::time::Instant::now()-Duration::from_secs(2);loop{
             if let Ok(profiles)=with_store(&s,|s|s.rows("SELECT DISTINCT external_profile FROM rooms WHERE source='hermes' AND deleted_at IS NULL AND external_profile NOT LIKE 'remote::%'",[])){for row in profiles{let profile=first(&row,&["external_profile"],"default");let active=b.call("session.active_list",json!({"profile":profile}),10).await;let sessions=if active["ok"]==true{array(&active["result"]["sessions"])}else{&[]};if let Ok(mut m)=m.lock(){m.update_active_sessions(profile,sessions);}}}
-            if persisted.elapsed()>=Duration::from_secs(2){let _=sync_recent_hermes_transcripts(&s,&b,8).await;persisted=tokio::time::Instant::now();}tokio::time::sleep(Duration::from_millis(500)).await;
+            if persisted.elapsed()>=Duration::from_secs(2){let _=sync_recent_hermes_transcripts(&s,&b,8).await;persisted=tokio::time::Instant::now();}tokio::time::sleep(Duration::from_millis(1000)).await;
         }}));
         Ok(Self {
             bridge,

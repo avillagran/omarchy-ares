@@ -1138,6 +1138,9 @@ fn post(store: &Store, path: &str, body: &Value) -> Result<Response> {
         "/v1/preferences" => return Ok(ok(json!({"preferences":store.update_preferences(body)?}))),
         "/v1/tty/ensure" => return Ok(ok(crate::herdr::ensure_and_state()?)),
         "/v1/control/ensure" => return Ok(ok(json!({"room":store.ensure_control_room()?}))),
+        "/v1/orchestrator/ensure" => {
+            return Ok(ok(json!({"room":store.ensure_orchestrator_room()?})))
+        }
         "/v1/control/decisions" => {
             return Ok(ok(json!({"event":store.record_control_decision(
             text(body,"roomId"),text(body,"action"),text(body,"note"))?})))

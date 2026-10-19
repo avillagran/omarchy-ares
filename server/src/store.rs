@@ -770,7 +770,10 @@ impl Store {
     }
     pub fn live_events(&self, room: &str) -> Result<Vec<Value>> {
         self.room(room, true)?;
-        self.dtos("room_events","SELECT * FROM room_events WHERE room_id=? AND json_extract(payload,'$.ephemeral')=1 ORDER BY created_at,sequence",[room])
+        // Ephemeral deltas are transient; scan only the recent cursor window.
+        // A full-room json_extract scan re-read the whole room (potentially
+        // hundreds of MB) on every live poll.
+        self.dtos("room_events","SELECT * FROM room_events WHERE room_id=? AND cursor>(SELECT COALESCE(MAX(cursor),0)-400 FROM room_events WHERE room_id=?) AND json_extract(payload,'$.ephemeral')=1 ORDER BY cursor",[room,room])
     }
     pub fn events_after(&self, cursor: i64, limit: i64, room: Option<&str>) -> Result<Value> {
         let rows = self.dtos("room_events","SELECT * FROM room_events WHERE cursor>? AND (? IS NULL OR room_id=?) ORDER BY cursor LIMIT ?",params![cursor,room,room,limit.clamp(1,1000)])?;
@@ -831,7 +834,7 @@ impl Store {
                     page = json!({"roomId":id,"earliestCursor":rows.first().map(|r| r["cursor"].clone()).unwrap_or(json!(0)),"hasOlder":total>rows.len() as i64,"limit":40});
                     rows
                 } else {
-                    self.dtos("room_events","SELECT * FROM room_events WHERE room_id=? ORDER BY created_at DESC,sequence DESC LIMIT 1",[id])?
+                    self.dtos("room_events","SELECT * FROM room_events WHERE room_id=? ORDER BY cursor DESC LIMIT 1",[id])?
                 }
             } else {
                 self.dtos(

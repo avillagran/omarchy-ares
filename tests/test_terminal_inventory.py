@@ -98,3 +98,80 @@ class InventoryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class StaleSessionSocketTest(unittest.TestCase):
+    """A bound-but-listenerless session socket is a stopped session, not an error."""
+
+    def _home_with_sockets(self, directory, names):
+        import socket as sock
+        home = Path(directory)
+        listeners = []
+        for name, live in names:
+            path = home / "cfg/herdr/herdr.sock" if name == "default" else home / ("cfg/herdr/sessions/" + name) / "herdr.sock"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            listener = sock.socket(sock.AF_UNIX, sock.SOCK_STREAM)
+            listener.bind(str(path))
+            if live:
+                listener.listen(1)
+                listeners.append(listener)
+            else:
+                listener.close()  # the socket file remains without a listener
+        return home, listeners
+
+    @staticmethod
+    def _cli_reply(requested):
+        import json as json_module
+        from types import SimpleNamespace
+        stopped = json_module.dumps({"id": "cli:api:snapshot", "error": {
+            "code": "server_not_running",
+            "message": "no herdr server is running at the socket"}})
+        def run(argv, env=None, **kwargs):
+            target = (env or {}).get("HERDR_SOCKET_PATH", "")
+            if "/sessions/" in target:
+                raise subprocess.CalledProcessError(1, argv, output="", stderr=stopped)
+            return SimpleNamespace(stdout=json_module.dumps({"result": {"snapshot": snapshot()}}))
+        return run
+
+    def test_stale_session_is_skipped_without_poisoning_complete_inventory(self):
+        from unittest.mock import patch as mock_patch
+        with tempfile.TemporaryDirectory() as directory:
+            home, listeners = self._home_with_sockets(directory, [("default", True), ("ares", False), ("hermes", False)])
+            self.addCleanup(lambda: [listener.close() for listener in listeners])
+            with mock_patch.object(probe.Path, "home", return_value=home), \
+                 mock_patch.dict(os.environ, {"XDG_CONFIG_HOME": str(home / "cfg")}), \
+                 mock_patch.object(probe.subprocess, "run", side_effect=self._cli_reply(None)):
+                inventory = probe.read_inventory()
+            self.assertTrue(inventory["complete"], "dead sessions must not fail the live inventory")
+            self.assertEqual([], inventory["errors"])
+            self.assertTrue(inventory["terminals"])
+            self.assertEqual(sorted(item["herdrSession"] for item in inventory.get("stale", [])),
+                             ["ares", "hermes"], "stopped sessions stay visible as informational")
+
+    def test_live_session_with_a_failing_snapshot_still_fails_closed(self):
+        from unittest.mock import patch as mock_patch
+        with tempfile.TemporaryDirectory() as directory:
+            home, listeners = self._home_with_sockets(directory, [("default", True), ("ares", True)])
+            self.addCleanup(lambda: [listener.close() for listener in listeners])
+            with mock_patch.object(probe.Path, "home", return_value=home), \
+                 mock_patch.dict(os.environ, {"XDG_CONFIG_HOME": str(home / "cfg")}), \
+                 mock_patch.object(probe.subprocess, "run", side_effect=OSError("snapshot boom")):
+                inventory = probe.read_inventory()
+            self.assertFalse(inventory["complete"])
+            self.assertEqual({item["herdrSession"] for item in inventory["errors"]}, {"default", "ares"})
+            self.assertEqual([], inventory.get("stale", []))
+
+    def test_a_live_but_empty_session_is_not_reported_stale(self):
+        import json as json_module
+        from types import SimpleNamespace
+        from unittest.mock import patch as mock_patch
+        with tempfile.TemporaryDirectory() as directory:
+            home, listeners = self._home_with_sockets(directory, [("default", True)])
+            self.addCleanup(lambda: [listener.close() for listener in listeners])
+            empty = SimpleNamespace(stdout=json_module.dumps({"result": {"snapshot": {"panes": [], "agents": [], "tabs": [], "workspaces": []}}}))
+            with mock_patch.object(probe.Path, "home", return_value=home), \
+                 mock_patch.dict(os.environ, {"XDG_CONFIG_HOME": str(home / "cfg")}), \
+                 mock_patch.object(probe.subprocess, "run", return_value=empty):
+                inventory = probe.read_inventory()
+            self.assertTrue(inventory["complete"])
+            self.assertEqual([], inventory["terminals"])
+            self.assertEqual([], inventory.get("stale", []), "a running session with zero panes is live, not stale")
